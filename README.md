@@ -289,7 +289,6 @@ For units that will actually ship, generate a real batch key/cert offline (ideal
 * [x] **Encrypted Backup Solutions:** Architect a secure, user-controlled export/import mechanism for offline backup and recovery.
 * [x] **Rethinking communication with ESP32:** Adding better communication protocols (instead of simple text).
 * [ ] **Technical Documentation:** Draft comprehensive technical documentation covering hardware schematics, firmware structure, and protocol flows.
-* [ ] **Add ATECC608:** Add encrypted storage for better security.
 * [ ] **Mobile Companion Application:** Explore the feasibility of a companion mobile application for credential management.
 * [ ] **Browser Extension Security:** Audit the browser extension pipeline against malicious script injections and clickjacking vectors.
 * [ ] **Physical Security (PCB):** Design a custom Printed Circuit Board (PCB) integrating physical tamper-mesh layers and environmental sensors.
