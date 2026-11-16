@@ -21,20 +21,13 @@ bool importVaultPlaintext(JsonDocument &in, bool overwrite, uint32_t &importedCo
 #define MAX_BACKUP_HEX_LEN (512UL * 1024UL)
 
 static bool deriveBackupKey(const String &passphrase, const uint8_t *salt, uint32_t iterations, uint8_t keyOut[32]) {
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    if (mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1) != 0) {
-        mbedtls_md_free(&ctx);
-        return false;
-    }
-    int rc = mbedtls_pkcs5_pbkdf2_hmac(
-        &ctx,
+    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(
+        MBEDTLS_MD_SHA256,
         (const unsigned char *)passphrase.c_str(), passphrase.length(),
         salt, BACKUP_SALT_LEN,
         iterations,
         32, keyOut
     );
-    mbedtls_md_free(&ctx);
     return rc == 0;
 }
 

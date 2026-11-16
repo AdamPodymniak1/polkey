@@ -6,6 +6,7 @@
 #include "StorageManager.h"
 #include <vector>
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 
 #define DEBUG_UART_BAUD  115200
 

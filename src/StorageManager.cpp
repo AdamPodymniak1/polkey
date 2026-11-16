@@ -33,14 +33,10 @@ static bool rpFieldMatchesRpId(const String &storedRpField, const String &plainR
 }
 
 void deriveStorageKey(const String &pin) {
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-
     const unsigned char salt[] = "VAULT_STORAGE_SALT";
 
-    mbedtls_pkcs5_pbkdf2_hmac(
-        &ctx,
+    mbedtls_pkcs5_pbkdf2_hmac_ext(
+        MBEDTLS_MD_SHA256,
         (const unsigned char *)pin.c_str(),
         pin.length(),
         salt,
@@ -50,7 +46,6 @@ void deriveStorageKey(const String &pin) {
         storageKey
     );
 
-    mbedtls_md_free(&ctx);
     isStorageKeyLoaded = true;
 }
 

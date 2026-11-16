@@ -15,6 +15,7 @@
 #include <Ed25519.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <esp_mac.h>
 
 #define PBKDF2_ITERATIONS 10000
 #define HASH_SIZE 32
@@ -159,54 +160,61 @@ void processHandshake(const String &clientPubHex) {
 
   delay(esp_random() % 15 + 2); 
 
-  mbedtls_ecdh_context ctx;
-  mbedtls_ecdh_init(&ctx);
+  /* mbedTLS 3.x keeps the ECDH state private, so drive the EC primitives
+   * directly instead of reaching into mbedtls_ecdh_context members. */
+  mbedtls_ecp_group grp;
+  mbedtls_mpi d;
+  mbedtls_mpi z;
+  mbedtls_ecp_point Q;
+  mbedtls_ecp_point Qp;
+  byte clientPubBuf[65] = {0}; 
+  byte sharedSecret[32];
+  uint8_t exportBuf[70];
+  size_t exportLen = 0;
 
-  int ret = mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1);
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi_init(&d);
+  mbedtls_mpi_init(&z);
+  mbedtls_ecp_point_init(&Q);
+  mbedtls_ecp_point_init(&Qp);
+
+  int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
   if (ret != 0) {
     Serial.println("[ERR] ECDH_GRP_LOAD_FAIL");
-    mbedtls_ecdh_free(&ctx);
-    return;
+    goto cleanup;
   }
 
-  ret = mbedtls_ecdh_gen_public(&ctx.grp, &ctx.d, &ctx.Q, hw_rng_callback, NULL);
+  ret = mbedtls_ecdh_gen_public(&grp, &d, &Q, hw_rng_callback, NULL);
   if (ret != 0) {
     Serial.println("[ERR] ECDH_GEN_PUB_FAIL");
-    mbedtls_ecdh_free(&ctx);
-    return;
+    goto cleanup;
   }
 
   yield(); 
 
-  byte clientPubBuf[65] = {0}; 
   fromHex(clientPubHex, clientPubBuf, sizeof(clientPubBuf));
 
-  ret = mbedtls_ecp_point_read_binary(&ctx.grp, &ctx.Qp, clientPubBuf, sizeof(clientPubBuf));
+  ret = mbedtls_ecp_point_read_binary(&grp, &Qp, clientPubBuf, sizeof(clientPubBuf));
 
   if (ret != 0) {
     Serial.println("[ERR] ECDH_PEER_KEY_INVALID");
-    mbedtls_ecdh_free(&ctx);
-    return;
+    goto cleanup;
   }
 
   delay(esp_random() % 10 + 1); 
 
-  ret = mbedtls_ecdh_compute_shared(&ctx.grp, &ctx.z, &ctx.Qp, &ctx.d, hw_rng_callback, NULL);
+  ret = mbedtls_ecdh_compute_shared(&grp, &z, &Qp, &d, hw_rng_callback, NULL);
   if (ret != 0) {
     Serial.println("[ERR] ECDH_COMPUTE_SHARED_FAIL");
-    mbedtls_ecdh_free(&ctx);
-    return;
+    goto cleanup;
   }
 
   yield(); 
 
-  byte sharedSecret[32];
-  mbedtls_mpi_write_binary(&ctx.z, sharedSecret, sizeof(sharedSecret));
+  mbedtls_mpi_write_binary(&z, sharedSecret, sizeof(sharedSecret));
   mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), sharedSecret, sizeof(sharedSecret), aesKey);
 
-  uint8_t exportBuf[70];
-  size_t exportLen = 0;
-  mbedtls_ecp_point_write_binary(&ctx.grp, &ctx.Q, MBEDTLS_ECP_PF_UNCOMPRESSED, &exportLen, exportBuf, sizeof(exportBuf));
+  mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED, &exportLen, exportBuf, sizeof(exportBuf));
 
   if (fi_state != FI_MAGIC_START) {
     ESP.restart(); 
@@ -218,36 +226,49 @@ void processHandshake(const String &clientPubHex) {
   Serial.print("DH_ACK:");
   Serial.println(toHex(exportBuf, exportLen));
 
-  mbedtls_ecdh_free(&ctx);
+cleanup:
+  memset(sharedSecret, 0, sizeof(sharedSecret));
+  mbedtls_ecp_point_free(&Qp);
+  mbedtls_ecp_point_free(&Q);
+  mbedtls_mpi_free(&z);
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_group_free(&grp);
 }
 
 bool fidoEcdhSharedSecret(const uint8_t devicePriv32[32], const uint8_t peerXY64[64], uint8_t sharedOut32[32]) {
-  mbedtls_ecdh_context ctx;
-  mbedtls_ecdh_init(&ctx);
-
-  int ret = mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1);
-  if (ret != 0) { mbedtls_ecdh_free(&ctx); return false; }
-
-  ret = mbedtls_mpi_read_binary(&ctx.d, devicePriv32, 32);
-  if (ret != 0) { mbedtls_ecdh_free(&ctx); return false; }
-
+  mbedtls_ecp_group grp;
+  mbedtls_mpi d;
+  mbedtls_mpi z;
+  mbedtls_ecp_point Qp;
   uint8_t peerUncompressed[65];
+  uint8_t rawShared[32];
+  bool ok = false;
+
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi_init(&d);
+  mbedtls_mpi_init(&z);
+  mbedtls_ecp_point_init(&Qp);
+
+  if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) != 0) goto cleanup;
+  if (mbedtls_mpi_read_binary(&d, devicePriv32, 32) != 0) goto cleanup;
+
   peerUncompressed[0] = 0x04;
   memcpy(peerUncompressed + 1, peerXY64, 64);
 
-  ret = mbedtls_ecp_point_read_binary(&ctx.grp, &ctx.Qp, peerUncompressed, sizeof(peerUncompressed));
-  if (ret != 0) { mbedtls_ecdh_free(&ctx); return false; }
+  if (mbedtls_ecp_point_read_binary(&grp, &Qp, peerUncompressed, sizeof(peerUncompressed)) != 0) goto cleanup;
+  if (mbedtls_ecdh_compute_shared(&grp, &z, &Qp, &d, hw_rng_callback, NULL) != 0) goto cleanup;
 
-  ret = mbedtls_ecdh_compute_shared(&ctx.grp, &ctx.z, &ctx.Qp, &ctx.d, hw_rng_callback, NULL);
-  if (ret != 0) { mbedtls_ecdh_free(&ctx); return false; }
-
-  uint8_t rawShared[32];
-  mbedtls_mpi_write_binary(&ctx.z, rawShared, sizeof(rawShared));
+  mbedtls_mpi_write_binary(&z, rawShared, sizeof(rawShared));
   mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), rawShared, sizeof(rawShared), sharedOut32);
-  memset(rawShared, 0, sizeof(rawShared));
+  ok = true;
 
-  mbedtls_ecdh_free(&ctx);
-  return true;
+cleanup:
+  memset(rawShared, 0, sizeof(rawShared));
+  mbedtls_ecp_point_free(&Qp);
+  mbedtls_mpi_free(&z);
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_group_free(&grp);
+  return ok;
 }
 
 bool aesCbcZeroIvEncrypt(const uint8_t key32[32], const uint8_t *in, size_t len, uint8_t *out) {
@@ -614,9 +635,9 @@ bool generateRsa2048KeyPair(String& privateKeyHexOut, uint8_t* nOut, size_t* nLe
         privateKeyHexOut += String(p[i], HEX);
     }
 
-    mbedtls_mpi_write_binary(&rsa->N, nOut, 256);
+    mbedtls_mpi_write_binary(&rsa->MBEDTLS_PRIVATE(N), nOut, 256);
     *nLen = 256;
-    mbedtls_mpi_write_binary(&rsa->E, eOut, 3);
+    mbedtls_mpi_write_binary(&rsa->MBEDTLS_PRIVATE(E), eOut, 3);
     *eLen = 3;
 
     mbedtls_pk_free(&ctx);
@@ -656,7 +677,7 @@ bool generateAlgSignature(int algId, const String& privateKeyHex, const uint8_t*
         
         mbedtls_pk_context ctx;
         mbedtls_pk_init(&ctx);
-        int ret = mbedtls_pk_parse_key(&ctx, derBuf, derLen, NULL, 0);
+        int ret = mbedtls_pk_parse_key(&ctx, derBuf, derLen, NULL, 0, NULL, NULL);
         free(derBuf);
         if (ret != 0) { mbedtls_pk_free(&ctx); return false; }
         
@@ -664,7 +685,7 @@ bool generateAlgSignature(int algId, const String& privateKeyHex, const uint8_t*
         if (!*sigOut) { mbedtls_pk_free(&ctx); return false; }
         
         size_t slen = 0;
-        ret = mbedtls_pk_sign(&ctx, MBEDTLS_MD_SHA256, hash, 32, *sigOut, &slen, mbedtls_fido2_rng, NULL);
+        ret = mbedtls_pk_sign(&ctx, MBEDTLS_MD_SHA256, hash, 32, *sigOut, 512, &slen, mbedtls_fido2_rng, NULL);
         *sigLen = slen;
         mbedtls_pk_free(&ctx);
         if (ret != 0) { free(*sigOut); *sigOut = nullptr; }
