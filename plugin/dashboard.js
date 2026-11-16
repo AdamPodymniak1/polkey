@@ -133,7 +133,7 @@ function processIncomingLine(text) {
                     pendingAutoGenerate = null;
                     fillCredentialsInTab(targetObj, passwordValue);
                 }
-            } else if (jsonMsg.module === "PASS" && jsonMsg.event === "UPDATED") {
+            } else if (jsonMsg.module === "PASS" && (jsonMsg.event === "UPDATED" || jsonMsg.event === "DISPLAYED")) {
                 setAuthState("READY");
             } else if (jsonMsg.module === "BACKUP") {
                 if (jsonMsg.event === "EXPORT_START" && jsonMsg.data) {
@@ -173,6 +173,10 @@ function processIncomingLine(text) {
 
     let safeText = text;
     if (jsonMsg && jsonMsg.type === "event" && jsonMsg.event === "TRANSMITTED" && jsonMsg.data && jsonMsg.data.password) {
+        const maskedMsg = JSON.parse(JSON.stringify(jsonMsg));
+        maskedMsg.data.password = "********";
+        safeText = JSON.stringify(maskedMsg);
+    } else if (jsonMsg && jsonMsg.type === "event" && jsonMsg.event === "DISPLAYED" && jsonMsg.data && jsonMsg.data.password) {
         const maskedMsg = JSON.parse(JSON.stringify(jsonMsg));
         maskedMsg.data.password = "********";
         safeText = JSON.stringify(maskedMsg);
@@ -453,6 +457,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ status: "ok" });
     } else if (message.type === "CMD_LIST_PASS") {
         sendSecure({ cmd: "LIST_PASS" });
+        sendResponse({ status: "ok" });
+    } else if (message.type === "CMD_SHOW_PASS") {
+        sendSecure({ cmd: "SHOW_PASS", site: message.site || message.name, login: message.login });
         sendResponse({ status: "ok" });
     } else if (message.type === "CMD_LIST_FIDO") {
         sendSecure({ cmd: "LIST_FIDO" });

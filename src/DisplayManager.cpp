@@ -8,6 +8,7 @@ U8G2_SSD1306_128X32_UNIVISION_F_4W_SW_SPI u8g2(U8G2_R0, 12, 11, 10, 9, 13);
 static String activeLine1 = "";
 static String activeLine2 = "";
 static unsigned long animStartMs = 0;
+static bool isEssential = false;
 static TaskHandle_t displayTaskHandle = NULL;
 static uint32_t currentSecurityNonce = 0;
 static unsigned long lastNonceUpdate = 0;
@@ -22,6 +23,29 @@ void displayRenderTask(void *pvParameters) {
         String t1 = activeLine1;
         String t2 = activeLine2;
         unsigned long startMs = animStartMs;
+        bool keep = isEssential;
+
+        // Any non-essential message on OLED lasts max 1 minute (60000 ms) before disappearing
+        if (!keep && (t1.length() > 0 || t2.length() > 0) && (millis() - startMs >= 60000)) {
+            activeLine1 = "";
+            activeLine2 = "";
+            t1 = "";
+            t2 = "";
+            u8g2.clearBuffer();
+            u8g2.sendBuffer();
+            xSemaphoreGive(displayMutex);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // If there is no active text, keep screen cleared to prevent burn-in
+        if (t1.length() == 0 && t2.length() == 0) {
+            u8g2.clearBuffer();
+            u8g2.sendBuffer();
+            xSemaphoreGive(displayMutex);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
         
         // Generate a new anti-spoof nonce every 2 seconds
         if (millis() - lastNonceUpdate > 2000) {
@@ -75,7 +99,7 @@ void displayRenderTask(void *pvParameters) {
 }
 
 // Public entry point for prompting text on the display.
-void showDisplayMessage(int lines, String text1, String text2, unsigned long timeoutMs) {
+void showDisplayMessage(int lines, String text1, String text2, unsigned long timeoutMs, bool requireStay) {
     // Initialize the render task on the first use.
     if (displayTaskHandle == NULL) {
         xTaskCreatePinnedToCore(displayRenderTask, "DispTask", 4096, NULL, 1, &displayTaskHandle, 1);
@@ -83,15 +107,25 @@ void showDisplayMessage(int lines, String text1, String text2, unsigned long tim
 
     // Update the shared frame data safely.
     xSemaphoreTake(displayMutex, portMAX_DELAY);
-    if (activeLine1 != text1 || activeLine2 != text2) {
-        activeLine1 = text1;
-        activeLine2 = (lines >= 2) ? text2 : "";
-        animStartMs = millis();
-    }
+    activeLine1 = text1;
+    activeLine2 = (lines >= 2) ? text2 : "";
+    animStartMs = millis();
+    isEssential = requireStay;
     xSemaphoreGive(displayMutex);
 
     // Allow the caller to block briefly while the message remains visible.
     if (timeoutMs > 0) {
         vTaskDelay(timeoutMs / portTICK_PERIOD_MS);
     }
+}
+
+void clearDisplay() {
+    xSemaphoreTake(displayMutex, portMAX_DELAY);
+    activeLine1 = "";
+    activeLine2 = "";
+    animStartMs = 0;
+    isEssential = false;
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+    xSemaphoreGive(displayMutex);
 }

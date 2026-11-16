@@ -116,7 +116,7 @@ bool enrollFingerprint(uint8_t id) {
 }
 
 void updateFingerprintAsync() {
-    if (currentCommandState != STATE_AWAITING_FINGERPRINT && currentCommandState != STATE_AWAITING_FINGERPRINT_UPDATE) return;
+    if (currentCommandState != STATE_AWAITING_FINGERPRINT && currentCommandState != STATE_AWAITING_FINGERPRINT_UPDATE && currentCommandState != STATE_AWAITING_FINGERPRINT_SHOW) return;
 
 #if USE_FINGERPRINT_SIMULATOR
     if (digitalRead(SIMULATOR_BUTTON_PIN) == LOW) {
@@ -133,6 +133,21 @@ void updateFingerprintAsync() {
             secureWipe(pendingLogin);
             secureWipe(pendingPasswordToSave);
             currentCommandState = STATE_READY;
+            return;
+        }
+        if (currentCommandState == STATE_AWAITING_FINGERPRINT_SHOW) {
+            JsonDocument data;
+            data["site"] = pendingWebsite;
+            data["login"] = pendingLogin;
+            data["password"] = pendingPasswordToTransmit;
+            CommsManager::sendEvent("PASS", "DISPLAYED", &data);
+
+            secureWipe(pendingPasswordToTransmit);
+            secureWipe(pendingWebsite);
+            secureWipe(pendingLogin);
+            currentCommandState = STATE_READY;
+
+            showDisplayMessage(1, "DISPLAYED!", "", 2000);
             return;
         }
         String challengeNonce = generateRandomPassword(16);
@@ -196,6 +211,26 @@ void updateFingerprintAsync() {
                         secureWipe(pendingLogin);
                         secureWipe(pendingPasswordToSave);
                         currentCommandState = STATE_READY;
+                        return;
+                    }
+                    if (currentCommandState == STATE_AWAITING_FINGERPRINT_SHOW) {
+                        JsonDocument data;
+                        data["site"] = pendingWebsite;
+                        data["login"] = pendingLogin;
+                        data["password"] = pendingPasswordToTransmit;
+                        CommsManager::sendEvent("PASS", "DISPLAYED", &data);
+
+                        secureWipe(pendingPasswordToTransmit);
+                        secureWipe(pendingWebsite);
+                        secureWipe(pendingLogin);
+                        currentCommandState = STATE_READY;
+
+                        showDisplayMessage(1, "DISPLAYED!", "", 0);
+
+                        unsigned long startWait = millis();
+                        while (millis() - startWait < 1200) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+
+                        showDisplayMessage(1, "Logged In", "", 0);
                         return;
                     }
                     

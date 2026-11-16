@@ -136,6 +136,7 @@ void cliTask(void *pvParameters) {
                 data["commands"][20] = "BACKUP_IMPORT_CHUNK";
                 data["commands"][21] = "BACKUP_IMPORT_COMMIT";
                 data["commands"][22] = "BACKUP_IMPORT_ABORT";
+                data["commands"][23] = "SHOW_PASS";
                 CommsManager::sendEvent("SYS", "HELP_MENU", &data);
             } 
             else if (cmd == "SAVE_PASS" || cmd == "create") {
@@ -166,6 +167,27 @@ void cliTask(void *pvParameters) {
                     pendingPasswordToTransmit = pw;
                     showDisplayMessage(2, "GETTING:", website, 0);
                     currentCommandState = STATE_AWAITING_FINGERPRINT; 
+                    CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");
+                } else {
+                    CommsManager::sendError("PASS", "NOT_FOUND");
+                }
+            } 
+            else if (cmd == "SHOW_PASS" || cmd == "show_pass" || cmd == "DISPLAY_PASS") {
+                String website = req["site"] | req["website"] | "";
+                String login = req["login"] | "";
+
+                if (website == "" || login == "") {
+                    CommsManager::sendError("PASS", "MISSING_ARGS");
+                    continue;
+                }
+
+                String pw = getPasswordFromStorage(website, login);
+                if (pw.length() > 0) {
+                    pendingPasswordToTransmit = pw;
+                    pendingWebsite = website;
+                    pendingLogin = login;
+                    showDisplayMessage(2, "SHOW PASS:", website, 0);
+                    currentCommandState = STATE_AWAITING_FINGERPRINT_SHOW;
                     CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");
                 } else {
                     CommsManager::sendError("PASS", "NOT_FOUND");
@@ -384,7 +406,7 @@ void setup() {
 
     if (!isBatchAttestationAvailable()) {
         Serial.println("[SYS:FATAL] No FIDO2 attestation identity provisioned. Refusing to boot.");
-        showDisplayMessage(2, "PROVISIONING", "REQUIRED", 0);
+        showDisplayMessage(2, "PROVISIONING", "REQUIRED", 0, true);
         while (1) {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
@@ -394,7 +416,7 @@ void setup() {
 
     initCrypto();
     if (!initStorage()) {
-        showDisplayMessage(1, "SPIFFS FAILED", "", 0);
+        showDisplayMessage(1, "SPIFFS FAILED", "", 0, true);
         return;
     }
     initFingerprintSensor();

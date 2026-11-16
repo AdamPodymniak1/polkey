@@ -62,7 +62,7 @@ function checkStatus() {
             document.getElementById('disconnectBtn').style.display = response.connected ? 'block' : 'none';
             currentAuthState = response.authState;
             
-            if (response.authState === "READY") {
+            if (response.authState === "READY" || response.authState === "AWAITING_FINGERPRINT") {
                 if (!isAuthenticated) {
                     isAuthenticated = true;
                     navTabs.style.display = 'flex';
@@ -177,6 +177,13 @@ function renderList(elementId, itemsArray, type) {
         const actionDiv = document.createElement('div');
         
         if (type === 'pass') {
+            const showBtn = document.createElement('button');
+            showBtn.className = "icon-btn";
+            showBtn.innerHTML = "👁️";
+            showBtn.title = `Display password for ${displayLabel}`;
+            showBtn.onclick = () => window.showPassword(rawItem);
+            actionDiv.appendChild(showBtn);
+
             const updateBtn = document.createElement('button');
             updateBtn.className = "icon-btn";
             updateBtn.innerHTML = "✏️";
@@ -458,6 +465,49 @@ window.updateItem = function(type, item) {
     chrome.runtime.sendMessage({ target: "dashboard", type: "SEND", payload: payload });
 };
 
+window.showPassword = function(item) {
+    if (!item) return;
+    const site = typeof item === "object" ? item.website : item;
+    const login = typeof item === "object" ? item.login : "";
+    const label = login ? `${site} (${login})` : site;
+
+    const warning = `⚠️ DANGER / SECURITY WARNING ⚠️\n\nDisplaying stored passwords in plain text is VERY DANGEROUS! Anyone viewing your screen or unauthorized software could compromise your account.\n\nDo you REALLY want to display the password for '${label}'?`;
+    if (!confirm(warning)) {
+        return;
+    }
+
+    showMsg(`Verify fingerprint on device to display password for '${site}'...`, "orange");
+    chrome.runtime.sendMessage({
+        target: "dashboard",
+        type: "CMD_SHOW_PASS",
+        site: site,
+        login: login
+    });
+};
+
+const closeRevealedPassBtn = document.getElementById('btnCloseRevealedPass');
+if (closeRevealedPassBtn) {
+    closeRevealedPassBtn.onclick = () => {
+        const card = document.getElementById('revealedPassCard');
+        if (card) card.style.display = 'none';
+        const valInput = document.getElementById('revealedPassValue');
+        if (valInput) valInput.value = '';
+        const labelEl = document.getElementById('revealedPassLabel');
+        if (labelEl) labelEl.innerText = '';
+    };
+}
+
+const copyRevealedPassBtn = document.getElementById('btnCopyRevealedPass');
+if (copyRevealedPassBtn) {
+    copyRevealedPassBtn.onclick = () => {
+        const valInput = document.getElementById('revealedPassValue');
+        if (valInput && valInput.value) {
+            navigator.clipboard.writeText(valInput.value);
+            showMsg("Password copied to clipboard!", "lime");
+        }
+    };
+}
+
 chrome.runtime.onMessage.addListener((message) => {
     if (message.target === "popup" && message.type === "BACKUP_PROGRESS") {
         setBackupStatus(`${message.message} (${message.percent}%)`, "#00ffff");
@@ -519,6 +569,31 @@ chrome.runtime.onMessage.addListener((message) => {
             } else if (json.module === "PASS" && json.event === "UPDATED") {
                 showMsg("Password updated successfully!", "lime");
                 document.getElementById('btnListPass').click();
+            } else if (json.module === "PASS" && json.event === "AWAITING_HARDWARE_APPROVAL") {
+                showMsg("Verify fingerprint on device...", "orange");
+            } else if (json.module === "PASS" && json.event === "DISPLAYED" && json.data) {
+                showMsg("Password retrieved!", "lime");
+
+                // Switch to Vault tab (password screen) if not active
+                const vaultTabBtn = document.querySelector('[data-tab="tab-dashboard"]');
+                const vaultTabContent = document.getElementById('tab-dashboard');
+                if (vaultTabBtn && vaultTabContent && !vaultTabContent.classList.contains('active')) {
+                    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                    vaultTabBtn.classList.add('active');
+                    vaultTabContent.classList.add('active');
+                }
+
+                const card = document.getElementById('revealedPassCard');
+                const valInput = document.getElementById('revealedPassValue');
+                const labelEl = document.getElementById('revealedPassLabel');
+                if (card && valInput && labelEl) {
+                    const site = json.data.site || "";
+                    const login = json.data.login || "";
+                    labelEl.innerText = login ? `${site} (${login})` : site;
+                    valInput.value = json.data.password || "";
+                    card.style.display = 'block';
+                }
             } else if (json.module === "AUTH" && json.event === "FINGERPRINT_ENROLLED") {
                 showMsg("Fingerprint enrolled successfully!", "lime");
             } else if (json.module === "SYS" && json.event === "FACTORY_RESET_COMPLETE") {
