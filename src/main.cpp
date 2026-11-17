@@ -167,6 +167,7 @@ void cliTask(void *pvParameters) {
                     pendingPasswordToTransmit = pw;
                     showDisplayMessage(2, "GETTING:", website, 0);
                     currentCommandState = STATE_AWAITING_FINGERPRINT; 
+                    setFingerprintLed(true);
                     CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");
                 } else {
                     CommsManager::sendError("PASS", "NOT_FOUND");
@@ -188,6 +189,7 @@ void cliTask(void *pvParameters) {
                     pendingLogin = login;
                     showDisplayMessage(2, "SHOW PASS:", website, 0);
                     currentCommandState = STATE_AWAITING_FINGERPRINT_SHOW;
+                    setFingerprintLed(true);
                     CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");
                 } else {
                     CommsManager::sendError("PASS", "NOT_FOUND");
@@ -281,6 +283,7 @@ void cliTask(void *pvParameters) {
                 pendingLogin = login;
                 pendingPasswordToSave = pass;
                 currentCommandState = STATE_AWAITING_FINGERPRINT_UPDATE;
+                setFingerprintLed(true);
 
                 showDisplayMessage(2, "AUTH TO UPDATE:", website, 0);
                 CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");

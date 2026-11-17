@@ -116,6 +116,7 @@ bool testFingerprintSubsystem() {
     printTestResult("Hardware: Optical Biometric UART Connection Handshake", true);
     return true;
 #else
+    fingerprintPowerOn();
     if (finger.verifyPassword()) {
         printTestResult("Hardware: Optical Biometric UART Connection Handshake", true);
 
@@ -123,6 +124,7 @@ bool testFingerprintSubsystem() {
         Serial.print("[SYS:INFO] Current Loaded Fingerprint Templates: ");
         Serial.println(finger.templateCount);
         printTestResult("Hardware: Synochip/Adafruit Parameter Extraction", true);
+        fingerprintKeepAlive();
         return true;
     } else {
         printTestResult("Hardware: Optical Biometric UART Connection Handshake", false);

@@ -9,24 +9,119 @@
 HardwareSerial mySerial(1);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 
+static bool fingerprintPowered = false;
+static bool fingerprintReady = false;
+static unsigned long fingerprintLastUseMs = 0;
+
+void fingerprintKeepAlive() {
+#if !USE_FINGERPRINT_SIMULATOR
+    fingerprintLastUseMs = millis();
+#endif
+}
+
+static void fingerprintRailOffLocked() {
+#if !USE_FINGERPRINT_SIMULATOR
+    if (!fingerprintPowered) return;
+
+    mySerial.end();
+    pinMode(FINGERPRINT_TX, OUTPUT);
+    digitalWrite(FINGERPRINT_TX, LOW);
+    pinMode(FINGERPRINT_RX, INPUT);
+
+    digitalWrite(FINGERPRINT_POWER_PIN, LOW);
+    fingerprintPowered = false;
+    fingerprintReady = false;
+#endif
+}
+
+bool fingerprintPowerOn() {
+#if USE_FINGERPRINT_SIMULATOR
+    return true;
+#else
+    fingerprintKeepAlive();
+    if (fingerprintPowered) return fingerprintReady;
+
+    pinMode(FINGERPRINT_POWER_PIN, OUTPUT);
+    digitalWrite(FINGERPRINT_POWER_PIN, HIGH);
+    fingerprintPowered = true;
+    fingerprintReady = false;
+
+    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
+    mySerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
+    finger.begin(57600);
+    for (uint8_t attempt = 0; attempt < 3 && !fingerprintReady; attempt++) {
+        if (attempt > 0) vTaskDelay(100 / portTICK_PERIOD_MS);
+        fingerprintReady = finger.verifyPassword();
+    }
+    if (!fingerprintReady) {
+        fingerprintRailOffLocked();
+    }
+    xSemaphoreGive(fingerprintMutex);
+
+    fingerprintKeepAlive();
+
+    if (!fingerprintReady) {
+        Serial.println("[SYS:WARN] Fingerprint module did not answer after power-up");
+    }
+    return fingerprintReady;
+#endif
+}
+
+void fingerprintPowerOff() {
+#if !USE_FINGERPRINT_SIMULATOR
+    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
+    fingerprintRailOffLocked();
+    xSemaphoreGive(fingerprintMutex);
+#endif
+}
+
+void fingerprintPowerIdleCheck() {
+#if !USE_FINGERPRINT_SIMULATOR
+    if (!fingerprintPowered) return;
+    if (millis() - fingerprintLastUseMs < FINGERPRINT_IDLE_POWER_OFF_MS) return;
+
+    if (xSemaphoreTake(fingerprintMutex, 0) != pdTRUE) return;
+    if (fingerprintPowered &&
+        millis() - fingerprintLastUseMs >= FINGERPRINT_IDLE_POWER_OFF_MS) {
+        fingerprintRailOffLocked();
+    }
+    xSemaphoreGive(fingerprintMutex);
+#endif
+}
+
+void setFingerprintLed(bool on) {
+#if !USE_FINGERPRINT_SIMULATOR
+    if (on) {
+        fingerprintPowerOn();
+    }
+    if (!fingerprintPowered || !fingerprintReady) return;
+
+    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
+    if (on) {
+        finger.LEDcontrol(true);
+        finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_BLUE, 0);
+    } else {
+        finger.LEDcontrol(false);
+        finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0, 0);
+    }
+    xSemaphoreGive(fingerprintMutex);
+    fingerprintKeepAlive();
+#endif
+}
+
 void initFingerprintSensor() {
 #if USE_FINGERPRINT_SIMULATOR
     pinMode(SIMULATOR_BUTTON_PIN, INPUT_PULLUP);
     CommsManager::sendEvent("SYS", "FP_SIM_READY");
 #else
-    mySerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
-
-    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
-    finger.begin(57600);
-    bool verified = finger.verifyPassword();
-    xSemaphoreGive(fingerprintMutex);
-
-    if (verified) {
+    if (fingerprintPowerOn()) {
         CommsManager::sendEvent("SYS", "FP_READY");
     } else {
         showDisplayMessage(1, "SENSOR ERROR!", "", 2000);
         CommsManager::sendError("SYS", "FP_SENSOR_ERROR");
     }
+
+    fingerprintPowerOff();
 #endif
 }
 
@@ -45,6 +140,7 @@ bool enrollFingerprint(uint8_t id) {
     showDisplayMessage(1, "STORED OK", "", 2000);
     return true;
 #else
+    setFingerprintLed(true);
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     finger.emptyDatabase();
     xSemaphoreGive(fingerprintMutex);
@@ -57,6 +153,7 @@ bool enrollFingerprint(uint8_t id) {
         xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
         p = finger.getImage();
         xSemaphoreGive(fingerprintMutex);
+        fingerprintKeepAlive();
         if (p != FINGERPRINT_OK) {
             vTaskDelay(50 / portTICK_PERIOD_MS);
         }
@@ -65,7 +162,10 @@ bool enrollFingerprint(uint8_t id) {
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     p = finger.image2Tz(1);
     xSemaphoreGive(fingerprintMutex);
-    if (p != FINGERPRINT_OK) return false;
+    if (p != FINGERPRINT_OK) {
+        setFingerprintLed(false);
+        return false;
+    }
 
     showDisplayMessage(1, "Remove finger", "", 0);
     vTaskDelay(1500 / portTICK_PERIOD_MS);
@@ -75,6 +175,7 @@ bool enrollFingerprint(uint8_t id) {
         xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
         p = finger.getImage();
         xSemaphoreGive(fingerprintMutex);
+        fingerprintKeepAlive();
         vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 
@@ -85,6 +186,7 @@ bool enrollFingerprint(uint8_t id) {
         xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
         p = finger.getImage();
         xSemaphoreGive(fingerprintMutex);
+        fingerprintKeepAlive();
         if (p != FINGERPRINT_OK) {
             vTaskDelay(50 / portTICK_PERIOD_MS);
         }
@@ -93,12 +195,16 @@ bool enrollFingerprint(uint8_t id) {
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     p = finger.image2Tz(2);
     xSemaphoreGive(fingerprintMutex);
-    if (p != FINGERPRINT_OK) return false;
+    if (p != FINGERPRINT_OK) {
+        setFingerprintLed(false);
+        return false;
+    }
 
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     p = finger.createModel();
     xSemaphoreGive(fingerprintMutex);
     if (p != FINGERPRINT_OK) {
+        setFingerprintLed(false);
         showDisplayMessage(1, "MISMATCH!", "", 3000);
         return false;
     }
@@ -106,6 +212,7 @@ bool enrollFingerprint(uint8_t id) {
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     p = finger.storeModel(id);
     xSemaphoreGive(fingerprintMutex);
+    setFingerprintLed(false);
     if (p == FINGERPRINT_OK) {
         showDisplayMessage(1, "STORED OK", "", 2000);
         return true;
@@ -116,6 +223,7 @@ bool enrollFingerprint(uint8_t id) {
 }
 
 void updateFingerprintAsync() {
+    fingerprintPowerIdleCheck();
     if (currentCommandState != STATE_AWAITING_FINGERPRINT && currentCommandState != STATE_AWAITING_FINGERPRINT_UPDATE && currentCommandState != STATE_AWAITING_FINGERPRINT_SHOW) return;
 
 #if USE_FINGERPRINT_SIMULATOR
@@ -164,6 +272,7 @@ void updateFingerprintAsync() {
         showDisplayMessage(1, "TRANSMITTED!", "", 0);
     }
 #else
+    fingerprintPowerOn();
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     uint8_t imageResult = finger.getImage();
     xSemaphoreGive(fingerprintMutex);
@@ -194,6 +303,7 @@ void updateFingerprintAsync() {
                     showDisplayMessage(1, "REPLAY DETECTED", "", 2000);
                     CommsManager::sendError("AUTH", "REPLAY_DETECTED");
                     currentCommandState = STATE_READY;
+                    setFingerprintLed(false);
                     return;
                 }
                 lastConfidenceScore = matchConfidence;
@@ -211,6 +321,7 @@ void updateFingerprintAsync() {
                         secureWipe(pendingLogin);
                         secureWipe(pendingPasswordToSave);
                         currentCommandState = STATE_READY;
+                        setFingerprintLed(false);
                         return;
                     }
                     if (currentCommandState == STATE_AWAITING_FINGERPRINT_SHOW) {
@@ -224,6 +335,7 @@ void updateFingerprintAsync() {
                         secureWipe(pendingWebsite);
                         secureWipe(pendingLogin);
                         currentCommandState = STATE_READY;
+                        setFingerprintLed(false);
 
                         showDisplayMessage(1, "DISPLAYED!", "", 0);
 
@@ -243,6 +355,7 @@ void updateFingerprintAsync() {
 
                     secureWipe(pendingPasswordToTransmit);
                     currentCommandState = STATE_READY;
+                    setFingerprintLed(false);
 
                     showDisplayMessage(1, "TRANSMITTED!", "", 0);
 
@@ -270,8 +383,10 @@ void updateFingerprintAsync() {
 
 void deleteAllFingerprints() {
 #if !USE_FINGERPRINT_SIMULATOR
+    fingerprintPowerOn();
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     finger.emptyDatabase();
     xSemaphoreGive(fingerprintMutex);
+    fingerprintKeepAlive();
 #endif
 }

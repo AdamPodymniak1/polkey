@@ -200,6 +200,7 @@ bool fidoVerifyFingerprint() {
     }
     return false;
 #else
+    fingerprintPowerOn();
     bool bootstrapMode = (getBioTemplateCount() == 0);
 
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
@@ -389,7 +390,9 @@ void FIDO2HIDDevice::processU2fCommand(uint32_t channel, uint8_t* data, uint16_t
             return;
         }
 
+        setFingerprintLed(true);
         bool uvOk = fidoVerifyFingerprint();
+        setFingerprintLed(false);
         fidoLogf("REG", "fidoVerifyFingerprint() -> %s", uvOk ? "OK" : "FAIL");
         if (!uvOk) {
             fidoLogf("REG", "REJECT 0x6985 SW_CONDITIONS_NOT_SATISFIED (waiting for touch / UV failed)");
@@ -3046,6 +3049,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
             if (!touched) return 0x09;
 #else
+            fingerprintPowerOn();
             xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
             uint8_t img = finger.getImage();
             xSemaphoreGive(fingerprintMutex);
@@ -3063,6 +3067,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                     lastKeepAlive = millis();
                 }
                 vTaskDelay(30 / portTICK_PERIOD_MS);
+                fingerprintKeepAlive();
                 xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
                 img = finger.getImage();
                 xSemaphoreGive(fingerprintMutex);
@@ -3086,6 +3091,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
                     p = finger.getImage();
                     xSemaphoreGive(fingerprintMutex);
+                    fingerprintKeepAlive();
                     vTaskDelay(50 / portTICK_PERIOD_MS);
                 }
 #endif
@@ -3430,9 +3436,11 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 return;
             }
 #if !USE_FINGERPRINT_SIMULATOR
+            fingerprintPowerOn();
             xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
             finger.deleteModel(targetId);
             xSemaphoreGive(fingerprintMutex);
+            fingerprintKeepAlive();
 #endif
             deleteBioTemplateRecord(targetId);
             if (bioEnrollActive && bioEnrollTemplateId == targetId) {
