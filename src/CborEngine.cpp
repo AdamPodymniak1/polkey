@@ -87,17 +87,21 @@ bool CborEncoder::writeByteString(const uint8_t *data, size_t len) {
 
 bool CborEncoder::writeTextString(const char *text) {
     size_t len = strlen(text);
-    if (offset + 1 + len + 2 >= capacity) return false;
+    if (len > 0xFFFF) return false;
+    size_t headerLen = len < 24 ? 1 : (len <= 0xFF ? 2 : 3);
+    if (offset + headerLen + len > capacity) return false;
 
     if (len < 24) {
         buffer[offset++] = (3 << 5) | (len & 0x1F);
-    } 
+    }
     else if (len <= 0xFF) {
         buffer[offset++] = (3 << 5) | 24;
         buffer[offset++] = (uint8_t)len;
-    } 
+    }
     else {
-        return false; 
+        buffer[offset++] = (3 << 5) | 25;
+        buffer[offset++] = (len >> 8) & 0xFF;
+        buffer[offset++] = len & 0xFF;
     }
 
     memcpy(&buffer[offset], text, len);
@@ -108,40 +112,45 @@ bool CborEncoder::writeTextString(const char *text) {
 bool CborParser::readTypeAndValue(uint8_t &majorType, uint64_t &value) {
     if (offset >= length) return false;
 
+    size_t start = offset;
     uint8_t initialByte = buffer[offset++];
     majorType = (initialByte >> 5) & 0x07;
     uint8_t additionalInfo = initialByte & 0x1F;
+    uint64_t v = 0;
 
     if (additionalInfo < 24) {
-        value = additionalInfo;
-        return true;
+        v = additionalInfo;
     } else if (additionalInfo == 24) {
-        if (offset >= length) return false;
-        value = buffer[offset++];
-        return true;
+        if (length - offset < 1) { offset = start; return false; }
+        v = buffer[offset++];
+        if (v < 24) { offset = start; return false; }
     } else if (additionalInfo == 25) {
-        if (offset + 1 >= length) return false;
-        value = ((uint64_t)buffer[offset] << 8) | buffer[offset + 1];
+        if (length - offset < 2) { offset = start; return false; }
+        v = ((uint64_t)buffer[offset] << 8) | buffer[offset + 1];
         offset += 2;
-        return true;
-    } else if (additionalInfo == 26) { 
-        if (offset + 3 >= length) return false;
-        value = ((uint64_t)buffer[offset] << 24) | ((uint64_t)buffer[offset + 1] << 16) | 
-                ((uint64_t)buffer[offset + 2] << 8) | buffer[offset + 3];
+        if (v <= 0xFF) { offset = start; return false; }
+    } else if (additionalInfo == 26) {
+        if (length - offset < 4) { offset = start; return false; }
+        v = ((uint64_t)buffer[offset] << 24) | ((uint64_t)buffer[offset + 1] << 16) |
+            ((uint64_t)buffer[offset + 2] << 8) | buffer[offset + 3];
         offset += 4;
-        return true;
-    } else if (additionalInfo == 27) { 
-        if (offset + 7 >= length) return false;
-        value = 0;
+        if (v <= 0xFFFF) { offset = start; return false; }
+    } else if (additionalInfo == 27) {
+        if (length - offset < 8) { offset = start; return false; }
         for (int i = 0; i < 8; i++) {
-            value = (value << 8) | buffer[offset++];
+            v = (v << 8) | buffer[offset++];
         }
-        return true;
-    } else if (additionalInfo == 0x1F) { 
-        value = 0xFFFFFFFFFFFFFFFFULL; 
-        return true;
+        if (v <= 0xFFFFFFFFULL) { offset = start; return false; }
+    } else {
+        offset = start;
+        return false;
     }
-    return false;
+
+    if (majorType == 6) { offset = start; return false; }
+    if (majorType == 7 && (additionalInfo < 20 || additionalInfo > 22)) { offset = start; return false; }
+
+    value = v;
+    return true;
 }
 
 bool CborParser::readByteString(uint8_t *destBuffer, size_t maxLen, size_t &actualLen) {
@@ -197,65 +206,41 @@ bool CborParser::skipValue(uint8_t depth) {
     if (depth > MAX_CBOR_DEPTH) return false;
     if (offset >= length) return false;
 
-    if (buffer[offset] == 0xFF) {
-        offset++;
-        return true;
-    }
-
+    size_t start = offset;
     uint8_t majorType;
     uint64_t value;
     if (!readTypeAndValue(majorType, value)) return false;
 
+    bool ok = true;
     switch (majorType) {
-        case 0: 
-        case 1: 
-        case 7: 
-            return true; 
-        case 2: 
-        case 3: 
-            if (value == 0xFFFFFFFFFFFFFFFFULL) { 
-                while (offset < length && buffer[offset] != 0xFF) {
-                    if (!skipValue(depth + 1)) return false;
-                }
-                if (offset >= length) return false;
-                offset++; 
-                return true;
+        case 0:
+        case 1:
+        case 7:
+            break;
+        case 2:
+        case 3:
+            if (value > length - offset) { ok = false; break; }
+            offset += (size_t)value;
+            break;
+        case 4:
+            if (value > MAX_CBOR_ELEMENTS) { ok = false; break; }
+            for (uint64_t i = 0; ok && i < value; i++) {
+                ok = skipValue(depth + 1);
             }
-            if (value > length - offset) return false;
-            offset += value;
-            return true;
-        case 4: 
-            if (value == 0xFFFFFFFFFFFFFFFFULL) { 
-                while (offset < length && buffer[offset] != 0xFF) {
-                    if (!skipValue(depth + 1)) return false;
-                }
-                if (offset >= length) return false;
-                offset++; 
-                return true;
+            break;
+        case 5:
+            if (value > MAX_CBOR_ELEMENTS) { ok = false; break; }
+            for (uint64_t i = 0; ok && i < value * 2; i++) {
+                ok = skipValue(depth + 1);
             }
-            if (value > MAX_CBOR_ELEMENTS) return false;
-            for (uint64_t i = 0; i < value; i++) {
-                if (!skipValue(depth + 1)) return false;
-            }
-            return true;
-        case 5: 
-            if (value == 0xFFFFFFFFFFFFFFFFULL) { 
-                while (offset < length && buffer[offset] != 0xFF) {
-                    if (!skipValue(depth + 1)) return false; 
-                    if (!skipValue(depth + 1)) return false; 
-                }
-                if (offset >= length) return false;
-                offset++; 
-                return true;
-            }
-            if (value > MAX_CBOR_ELEMENTS) return false;
-            for (uint64_t i = 0; i < value * 2; i++) {
-                if (!skipValue(depth + 1)) return false;
-            }
-            return true;
+            break;
         default:
-            return false;
+            ok = false;
+            break;
     }
+
+    if (!ok) offset = start;
+    return ok;
 }
 
 bool CborEncoder::writeArrayHeader(size_t elements) {
@@ -268,6 +253,12 @@ bool CborEncoder::writeArrayHeader(size_t elements) {
         if (offset + 1 >= capacity) return false;
         buffer[offset++] = (4 << 5) | 24;
         buffer[offset++] = (uint8_t)elements;
+        return true;
+    } else if (elements <= 0xFFFF) {
+        if (offset + 2 >= capacity) return false;
+        buffer[offset++] = (4 << 5) | 25;
+        buffer[offset++] = (elements >> 8) & 0xFF;
+        buffer[offset++] = elements & 0xFF;
         return true;
     }
 

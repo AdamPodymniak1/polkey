@@ -18,13 +18,207 @@ static String readSpiffsString(File &file) {
     uint16_t len;
     if (file.read((uint8_t*)&len, 2) != 2) return "";
     if (len == 0) return "";
-    char* buf = (char*)malloc(len + 1);
+    if ((size_t)len > (size_t)file.available()) {
+        file.seek(0, SeekEnd);
+        return "";
+    }
+    char* buf = (char*)calloc((size_t)len + 1, 1);
     if (!buf) return "";
-    file.read((uint8_t*)buf, len);
-    buf[len] = '\0';
+    if (file.read((uint8_t*)buf, len) != (size_t)len) {
+        free(buf);
+        file.seek(0, SeekEnd);
+        return "";
+    }
     String res(buf);
     free(buf);
     return res;
+}
+
+static bool readPayloadString(File &file, uint16_t len, String &out) {
+    out = "";
+    if (len == 0) return true;
+    if ((size_t)len > (size_t)file.available()) {
+        file.seek(0, SeekEnd);
+        return false;
+    }
+    char* buf = (char*)calloc((size_t)len + 1, 1);
+    if (!buf) return false;
+    if (file.read((uint8_t*)buf, len) != (size_t)len) {
+        free(buf);
+        file.seek(0, SeekEnd);
+        return false;
+    }
+    out = String(buf);
+    free(buf);
+    return true;
+}
+
+struct PasskeyFrame {
+    uint8_t status = 0;
+    int32_t algId = 0;
+    String cid;
+    String rp;
+    uint16_t payLen = 0;
+};
+
+static bool readFrameString(File &file, String &out) {
+    out = "";
+    uint16_t len;
+    if (file.read((uint8_t*)&len, 2) != 2) return false;
+    if ((size_t)len > (size_t)file.available()) return false;
+    if (len == 0) return true;
+    char* buf = (char*)calloc((size_t)len + 1, 1);
+    if (!buf) return false;
+    bool ok = file.read((uint8_t*)buf, len) == (size_t)len;
+    if (ok) out = String(buf);
+    free(buf);
+    return ok;
+}
+
+static bool readPasskeyFrame(File &file, PasskeyFrame &f) {
+    if (file.read(&f.status, 1) != 1) return false;
+    if (file.read((uint8_t*)&f.algId, 4) != 4) return false;
+    if (!readFrameString(file, f.cid)) return false;
+    if (!readFrameString(file, f.rp)) return false;
+    if (file.read((uint8_t*)&f.payLen, 2) != 2) return false;
+    return (size_t)f.payLen <= (size_t)file.available();
+}
+
+static void appendPasskeyFrame(std::vector<uint8_t> &out, uint8_t status, int32_t algId, const String &cid, const String &rp, const String &payload) {
+    out.push_back(status);
+    const uint8_t *alg = (const uint8_t *)&algId;
+    out.insert(out.end(), alg, alg + 4);
+    const String *fields[3] = {&cid, &rp, &payload};
+    for (const String *f : fields) {
+        uint16_t fl = (uint16_t)f->length();
+        const uint8_t *lb = (const uint8_t *)&fl;
+        out.insert(out.end(), lb, lb + 2);
+        out.insert(out.end(), (const uint8_t *)f->c_str(), (const uint8_t *)f->c_str() + fl);
+    }
+}
+
+static bool replacePasskeyFile(const std::vector<uint8_t> &content) {
+    File tmp = SPIFFS.open("/passkeys.tmp", "w");
+    if (!tmp) return false;
+    size_t written = content.empty() ? 0 : tmp.write(content.data(), content.size());
+    tmp.close();
+    if (written != content.size()) {
+        SPIFFS.remove("/passkeys.tmp");
+        return false;
+    }
+    SPIFFS.remove("/passkeys.bin");
+    SPIFFS.rename("/passkeys.tmp", "/passkeys.bin");
+    return true;
+}
+
+static int hexNibble(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static bool hexDecodeStrict(const String &hex, uint8_t *out, size_t expectedBytes) {
+    if (hex.length() != expectedBytes * 2) return false;
+    for (size_t i = 0; i < expectedBytes; i++) {
+        int hi = hexNibble(hex[2 * i]);
+        int lo = hexNibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void secureZero(void *p, size_t n) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) *v++ = 0;
+}
+
+static bool constantTimeEqual(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+struct PasskeyPayload {
+    String userIdHex;
+    String userName;
+    String privateKeyHex;
+    int credProtect = 1;
+    String largeBlobKeyHex;
+    String credBlobHex;
+};
+
+static String buildPasskeyPayload(const String &userIdHex, const String &userName, const String &privateKeyHex,
+                                  int credProtect, const String &largeBlobKeyHex, const String &credBlobHex) {
+    String nameHex = toHex((const byte *)userName.c_str(), userName.length());
+    return String("V2\n") + userIdHex + "\n" + nameHex + "\n" + privateKeyHex + "\n" + String(credProtect) + "\n" + largeBlobKeyHex + "\n" + credBlobHex;
+}
+
+static bool parsePasskeyPayload(const String &payload, PasskeyPayload &out) {
+    out = PasskeyPayload();
+    int n1 = payload.indexOf('\n');
+    if (n1 == -1) return false;
+
+    if (payload.substring(0, n1) == "V2") {
+        String fields[6];
+        int start = n1 + 1;
+        for (int i = 0; i < 6; i++) {
+            int nl = (i < 5) ? payload.indexOf('\n', start) : -1;
+            if (i < 5 && nl == -1) return false;
+            fields[i] = (i < 5) ? payload.substring(start, nl) : payload.substring(start);
+            start = nl + 1;
+        }
+        size_t nameBytes = fields[1].length() / 2;
+        if (fields[1].length() % 2 != 0 || nameBytes > 1024) return false;
+        String name;
+        if (nameBytes > 0) {
+            uint8_t *tmp = (uint8_t *)calloc(nameBytes + 1, 1);
+            if (!tmp) return false;
+            bool ok = hexDecodeStrict(fields[1], tmp, nameBytes);
+            if (ok) name = String((const char *)tmp);
+            free(tmp);
+            if (!ok) return false;
+        }
+        out.userIdHex = fields[0];
+        out.userName = name;
+        out.privateKeyHex = fields[2];
+        out.credProtect = fields[3].length() > 0 ? fields[3].toInt() : 1;
+        out.largeBlobKeyHex = fields[4];
+        out.credBlobHex = fields[5];
+        return true;
+    }
+
+    int firstNewline = n1;
+    int secondNewline = payload.indexOf('\n', firstNewline + 1);
+    if (secondNewline == -1) return false;
+
+    out.userIdHex = payload.substring(0, firstNewline);
+    out.userName = payload.substring(firstNewline + 1, secondNewline);
+
+    int thirdNewline = payload.indexOf('\n', secondNewline + 1);
+    int fourthNewline = (thirdNewline == -1) ? -1 : payload.indexOf('\n', thirdNewline + 1);
+    int fifthNewline = (fourthNewline == -1) ? -1 : payload.indexOf('\n', fourthNewline + 1);
+
+    if (thirdNewline == -1) {
+        out.privateKeyHex = payload.substring(secondNewline + 1);
+    } else {
+        out.privateKeyHex = payload.substring(secondNewline + 1, thirdNewline);
+        if (fourthNewline == -1) {
+            String cp = payload.substring(thirdNewline + 1);
+            if (cp.length() > 0) out.credProtect = cp.toInt();
+        } else {
+            String cp = payload.substring(thirdNewline + 1, fourthNewline);
+            if (cp.length() > 0) out.credProtect = cp.toInt();
+            if (fifthNewline == -1) {
+                out.largeBlobKeyHex = payload.substring(fourthNewline + 1);
+            } else {
+                out.largeBlobKeyHex = payload.substring(fourthNewline + 1, fifthNewline);
+                out.credBlobHex = payload.substring(fifthNewline + 1);
+            }
+        }
+    }
+    return true;
 }
 
 static bool rpFieldMatchesRpId(const String &storedRpField, const String &plainRpId) {
@@ -517,16 +711,10 @@ bool isPasskeyExists(const String &credentialIdHex) {
     }
     bool found = false;
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-        String cid = readSpiffsString(file);
-        uint16_t len;
-        file.read((uint8_t*)&len, 2);
-        file.seek(len, SeekCur);
-        file.read((uint8_t*)&len, 2);
-        file.seek(len, SeekCur);
-        if (status == 1 && cid == credentialIdHex) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        file.seek(f.payLen, SeekCur);
+        if (f.status == 1 && f.cid == credentialIdHex) {
             found = true;
             break;
         }
@@ -539,13 +727,24 @@ bool isPasskeyExists(const String &credentialIdHex) {
 bool savePasskeyRecord(const String &credentialIdHex, const String &rpId, const String &userIdHex, const String &userName, const String &privateKeyHex, int algId, int credProtect, const String &largeBlobKeyHex, const String &credBlobHex) {
     byte fidoKey[32];
     getFidoHardwareKey(fidoKey);
-    String rawPayload = userIdHex + "\n" + userName + "\n" + privateKeyHex + "\n" + String(credProtect) + "\n" + largeBlobKeyHex + "\n" + credBlobHex;
+    String rawPayload = buildPasskeyPayload(userIdHex, userName, privateKeyHex, credProtect, largeBlobKeyHex, credBlobHex);
     String encryptedPayload = encryptStoragePayload(rawPayload, fidoKey);
+    secureWipe(rawPayload);
 
     if (encryptedPayload == "") {
         CommsManager::sendError("FIDO2", "PASSKEY_ENC_FAILED", "Failed to encrypt passkey.");
         return false;
     }
+
+    if (credentialIdHex.length() == 0 || credentialIdHex.length() > 0xFFFF ||
+        rpId.length() > 0xFFFF || encryptedPayload.length() > 0xFFFF) {
+        CommsManager::sendError("FIDO2", "PASSKEY_TOO_LARGE", "Passkey record field exceeds format limits.");
+        return false;
+    }
+
+    std::vector<uint8_t> record;
+    record.reserve(11 + credentialIdHex.length() + rpId.length() + encryptedPayload.length());
+    appendPasskeyFrame(record, 1, (int32_t)algId, credentialIdHex, rpId, encryptedPayload);
 
     xSemaphoreTake(storageMutex, portMAX_DELAY);
     File file = SPIFFS.open("/passkeys.bin", "a");
@@ -554,25 +753,13 @@ bool savePasskeyRecord(const String &credentialIdHex, const String &rpId, const 
         CommsManager::sendError("FIDO2", "FILE_CREATE_FAILED", "Failed to open passkeys file.");
         return false;
     }
-
-    uint8_t status = 1;
-    file.write(&status, 1);
-    file.write((uint8_t*)&algId, 4);
-
-    uint16_t len = credentialIdHex.length();
-    file.write((uint8_t*)&len, 2);
-    file.write((uint8_t*)credentialIdHex.c_str(), len);
-
-    len = rpId.length();
-    file.write((uint8_t*)&len, 2);
-    file.write((uint8_t*)rpId.c_str(), len);
-
-    len = encryptedPayload.length();
-    file.write((uint8_t*)&len, 2);
-    file.write((uint8_t*)encryptedPayload.c_str(), len);
-
+    size_t written = file.write(record.data(), record.size());
     file.close();
     xSemaphoreGive(storageMutex);
+    if (written != record.size()) {
+        CommsManager::sendError("FIDO2", "FILE_WRITE_FAILED", "Failed to write passkey record.");
+        return false;
+    }
     CommsManager::sendEvent("FIDO2", "PASSKEY_SAVED");
     return true;
 }
@@ -600,31 +787,16 @@ bool getPasskeyRecord(const String &credentialIdHex, String &rpIdOut, String &us
     String encryptedPayload = "";
 
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        int currentAlgId;
-        file.read((uint8_t*)&currentAlgId, 4);
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-
-        if (status == 1 && cid == credentialIdHex) {
-            char* payBuf = (char*)malloc(payLen + 1);
-            if (payBuf) {
-                file.read((uint8_t*)payBuf, payLen);
-                payBuf[payLen] = '\0';
-                encryptedPayload = String(payBuf);
-                free(payBuf);
-            }
-            rpIdOut = rp;
-            algId = currentAlgId;
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        if (f.status == 1 && f.cid == credentialIdHex) {
+            readPayloadString(file, f.payLen, encryptedPayload);
+            rpIdOut = f.rp;
+            algId = f.algId;
             found = true;
             break;
-        } else {
-            file.seek(payLen, SeekCur);
         }
+        file.seek(f.payLen, SeekCur);
     }
     file.close();
     xSemaphoreGive(storageMutex);
@@ -634,40 +806,17 @@ bool getPasskeyRecord(const String &credentialIdHex, String &rpIdOut, String &us
     String decryptedPayload = decryptStoragePayload(encryptedPayload, fidoKey);
     if (decryptedPayload == "") return false;
 
-    int firstNewline = decryptedPayload.indexOf('\n');
-    int secondNewline = decryptedPayload.indexOf('\n', firstNewline + 1);
-    if (firstNewline == -1 || secondNewline == -1) return false;
+    PasskeyPayload parsed;
+    bool parsedOk = parsePasskeyPayload(decryptedPayload, parsed);
+    secureWipe(decryptedPayload);
+    if (!parsedOk) return false;
 
-    userIdHexOut = decryptedPayload.substring(0, firstNewline);
-    userNameOut = decryptedPayload.substring(firstNewline + 1, secondNewline);
-
-    int thirdNewline = decryptedPayload.indexOf('\n', secondNewline + 1);
-    int fourthNewline = (thirdNewline == -1) ? -1 : decryptedPayload.indexOf('\n', thirdNewline + 1);
-    int fifthNewline = (fourthNewline == -1) ? -1 : decryptedPayload.indexOf('\n', fourthNewline + 1);
-
-    credProtectOut = 1;
-    largeBlobKeyHexOut = "";
-    credBlobHexOut = "";
-
-    if (thirdNewline == -1) {
-        privateKeyHexOut = decryptedPayload.substring(secondNewline + 1);
-    } else {
-        privateKeyHexOut = decryptedPayload.substring(secondNewline + 1, thirdNewline);
-        if (fourthNewline == -1) {
-            String cp = decryptedPayload.substring(thirdNewline + 1);
-            if (cp.length() > 0) credProtectOut = cp.toInt();
-        } else {
-            String cp = decryptedPayload.substring(thirdNewline + 1, fourthNewline);
-            if (cp.length() > 0) credProtectOut = cp.toInt();
-            if (fifthNewline == -1) {
-                largeBlobKeyHexOut = decryptedPayload.substring(fourthNewline + 1);
-            } else {
-                largeBlobKeyHexOut = decryptedPayload.substring(fourthNewline + 1, fifthNewline);
-                credBlobHexOut = decryptedPayload.substring(fifthNewline + 1);
-            }
-        }
-    }
-
+    userIdHexOut = parsed.userIdHex;
+    userNameOut = parsed.userName;
+    privateKeyHexOut = parsed.privateKeyHex;
+    credProtectOut = parsed.credProtect;
+    largeBlobKeyHexOut = parsed.largeBlobKeyHex;
+    credBlobHexOut = parsed.credBlobHex;
     return true;
 }
 
@@ -696,37 +845,22 @@ String findCredentialIdByRpAndUser(const String &rpId, const String &userIdHex) 
 
     String foundCid = "";
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-
-        if (status == 1 && rpFieldMatchesRpId(rp, rpId)) {
-            char* payBuf = (char*)malloc(payLen + 1);
-            if (payBuf) {
-                file.read((uint8_t*)payBuf, payLen);
-                payBuf[payLen] = '\0';
-                String encryptedPayload(payBuf);
-                free(payBuf);
-
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        if (f.status == 1 && rpFieldMatchesRpId(f.rp, rpId)) {
+            String encryptedPayload;
+            if (readPayloadString(file, f.payLen, encryptedPayload)) {
                 String decryptedPayload = decryptStoragePayload(encryptedPayload, fidoKey);
-                if (decryptedPayload != "") {
-                    int firstNewline = decryptedPayload.indexOf('\n');
-                    if (firstNewline != -1) {
-                        String recUserId = decryptedPayload.substring(0, firstNewline);
-                        if (userIdHex == "" || recUserId == userIdHex) {
-                            foundCid = cid;
-                            break;
-                        }
+                PasskeyPayload rec;
+                if (decryptedPayload != "" && parsePasskeyPayload(decryptedPayload, rec)) {
+                    if (userIdHex == "" || rec.userIdHex == userIdHex) {
+                        foundCid = f.cid;
+                        break;
                     }
                 }
             }
         } else {
-            file.seek(payLen, SeekCur);
+            file.seek(f.payLen, SeekCur);
         }
     }
     file.close();
@@ -765,26 +899,16 @@ void listFidoWebsites() {
     std::vector<String> rpIds;
     size_t credentialCount = 0;
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-
-        uint16_t len;
-        file.read((uint8_t*)&len, 2);
-        file.seek(len, SeekCur);
-
-        String rp = readSpiffsString(file);
-
-        file.read((uint8_t*)&len, 2);
-        file.seek(len, SeekCur);
-
-        if (status == 1) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        file.seek(f.payLen, SeekCur);
+        if (f.status == 1) {
             credentialCount++;
             bool exists = false;
-            for (const String &s : rpIds) {
-                if (s == rp) { exists = true; break; }
+            for (const String &r : rpIds) {
+                if (r == f.rp) { exists = true; break; }
             }
-            if (!exists) rpIds.push_back(rp);
+            if (!exists) rpIds.push_back(f.rp);
         }
     }
     file.close();
@@ -813,61 +937,29 @@ bool deleteFidoWebsite(const String &rpId) {
         return false;
     }
 
-    File tempFile = SPIFFS.open("/passkeys.tmp", "w");
-    if (!tempFile) {
-        file.close();
-        xSemaphoreGive(storageMutex);
-        return false;
-    }
-
+    std::vector<uint8_t> kept;
     bool deletedAny = false;
-
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        int algId;
-        file.read((uint8_t*)&algId, 4);
-
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-        String pay = readSpiffsString(file);
-
-        if (status == 1 && rp == rpId) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        String pay;
+        if (!readPayloadString(file, f.payLen, pay)) break;
+        if (f.status == 1 && f.rp == rpId) {
             deletedAny = true;
-        } else if (status == 1) {
-            tempFile.write(&status, 1);
-            tempFile.write((uint8_t*)&algId, 4);
-
-            uint16_t len = cid.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)cid.c_str(), len);
-
-            len = rp.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)rp.c_str(), len);
-
-            len = pay.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)pay.c_str(), len);
+        } else if (f.status == 1) {
+            appendPasskeyFrame(kept, 1, f.algId, f.cid, f.rp, pay);
         }
     }
-
     file.close();
-    tempFile.close();
 
-    if (deletedAny) {
-        SPIFFS.remove("/passkeys.bin");
-        SPIFFS.rename("/passkeys.tmp", "/passkeys.bin");
-    } else {
-        SPIFFS.remove("/passkeys.tmp");
-    }
-
+    bool ok = deletedAny && replacePasskeyFile(kept);
     xSemaphoreGive(storageMutex);
-    return deletedAny;
+    return ok;
 }
 
 String getFidoWebsiteInfo(const String &rpId) {
-    if (!isStorageKeyLoaded) return "";
+    byte fidoKey[32];
+    getFidoHardwareKey(fidoKey);
     xSemaphoreTake(storageMutex, portMAX_DELAY);
     File file = SPIFFS.open("/passkeys.bin", "r");
     if (!file) {
@@ -877,36 +969,19 @@ String getFidoWebsiteInfo(const String &rpId) {
 
     String result = "";
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-
-        if (status == 1 && rp == rpId) {
-            char* payBuf = (char*)malloc(payLen + 1);
-            if (payBuf) {
-                file.read((uint8_t*)payBuf, payLen);
-                payBuf[payLen] = '\0';
-                String encryptedPayload(payBuf);
-                free(payBuf);
-
-                String decryptedPayload = decryptStoragePayload(encryptedPayload, storageKey);
-                if (decryptedPayload != "") {
-                    int firstNewline = decryptedPayload.indexOf('\n');
-                    int secondNewline = decryptedPayload.indexOf('\n', firstNewline + 1);
-                    if (firstNewline != -1 && secondNewline != -1) {
-                        String userName = decryptedPayload.substring(firstNewline + 1, secondNewline);
-                        result += userName + " | CRED_ID:" + cid + "\n";
-                    }
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        if (f.status == 1 && f.rp == rpId) {
+            String encryptedPayload;
+            if (readPayloadString(file, f.payLen, encryptedPayload)) {
+                String decryptedPayload = decryptStoragePayload(encryptedPayload, fidoKey);
+                PasskeyPayload rec;
+                if (decryptedPayload != "" && parsePasskeyPayload(decryptedPayload, rec)) {
+                    result += rec.userName + " | CRED_ID:" + f.cid + "\n";
                 }
             }
         } else {
-            file.seek(payLen, SeekCur);
+            file.seek(f.payLen, SeekCur);
         }
     }
     file.close();
@@ -1331,17 +1406,12 @@ std::vector<String> findAllCredentialsByRp(const String &rpId) {
         return results;
     }
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-        if (status == 1 && rpFieldMatchesRpId(rp, rpId)) {
-            results.push_back(cid);
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        file.seek(f.payLen, SeekCur);
+        if (f.status == 1 && rpFieldMatchesRpId(f.rp, rpId)) {
+            results.push_back(f.cid);
         }
-        file.seek(payLen, SeekCur);
     }
     file.close();
     xSemaphoreGive(storageMutex);
@@ -1357,16 +1427,11 @@ std::vector<String> getAllStoredCredentialIds() {
         return results;
     }
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-        String cid = readSpiffsString(file);
-        readSpiffsString(file);
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-        file.seek(payLen, SeekCur);
-        if (status == 1) {
-            results.push_back(cid);
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        file.seek(f.payLen, SeekCur);
+        if (f.status == 1) {
+            results.push_back(f.cid);
         }
     }
     file.close();
@@ -1383,20 +1448,15 @@ std::vector<String> getAllStoredRpIds() {
         return results;
     }
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        file.seek(4, SeekCur);
-        readSpiffsString(file);
-        String rp = readSpiffsString(file);
-        uint16_t payLen;
-        file.read((uint8_t*)&payLen, 2);
-        file.seek(payLen, SeekCur);
-        if (status == 1) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        file.seek(f.payLen, SeekCur);
+        if (f.status == 1) {
             bool exists = false;
-            for (const String &s : results) {
-                if (s == rp) { exists = true; break; }
+            for (const String &r : results) {
+                if (r == f.rp) { exists = true; break; }
             }
-            if (!exists) results.push_back(rp);
+            if (!exists) results.push_back(f.rp);
         }
     }
     file.close();
@@ -1412,56 +1472,24 @@ bool deletePasskeyRecord(const String &credentialIdHex) {
         return false;
     }
 
-    File tempFile = SPIFFS.open("/passkeys.tmp", "w");
-    if (!tempFile) {
-        file.close();
-        xSemaphoreGive(storageMutex);
-        return false;
-    }
-
+    std::vector<uint8_t> kept;
     bool deleted = false;
     while (file.available()) {
-        uint8_t status;
-        if (file.read(&status, 1) != 1) break;
-        int algId;
-        file.read((uint8_t*)&algId, 4);
-
-        String cid = readSpiffsString(file);
-        String rp = readSpiffsString(file);
-        String pay = readSpiffsString(file);
-
-        if (status == 1 && cid == credentialIdHex) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) break;
+        String pay;
+        if (!readPayloadString(file, f.payLen, pay)) break;
+        if (f.status == 1 && f.cid == credentialIdHex) {
             deleted = true;
-        } else if (status == 1) {
-            tempFile.write(&status, 1);
-            tempFile.write((uint8_t*)&algId, 4);
-
-            uint16_t len = cid.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)cid.c_str(), len);
-
-            len = rp.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)rp.c_str(), len);
-
-            len = pay.length();
-            tempFile.write((uint8_t*)&len, 2);
-            tempFile.write((uint8_t*)pay.c_str(), len);
+        } else if (f.status == 1) {
+            appendPasskeyFrame(kept, 1, f.algId, f.cid, f.rp, pay);
         }
     }
-
     file.close();
-    tempFile.close();
 
-    if (deleted) {
-        SPIFFS.remove("/passkeys.bin");
-        SPIFFS.rename("/passkeys.tmp", "/passkeys.bin");
-    } else {
-        SPIFFS.remove("/passkeys.tmp");
-    }
-
+    bool ok = deleted && replacePasskeyFile(kept);
     xSemaphoreGive(storageMutex);
-    return deleted;
+    return ok;
 }
 
 static void getStatelessMasterKeys(uint8_t* aesKey, uint8_t* hmacKey) {
@@ -1485,57 +1513,79 @@ static void getStatelessMasterKeys(uint8_t* aesKey, uint8_t* hmacKey) {
     mbedtls_md_free(&ctx);
 }
 
+static const size_t STATELESS_MAX_USER_ID = 64;
+static const size_t STATELESS_MAX_NAME = 32;
+static const size_t STATELESS_V1_HEADER = 108;
+
+static size_t utf8SafeLength(const String &s, size_t maxBytes) {
+    size_t len = s.length();
+    if (len <= maxBytes) return len;
+    size_t cut = maxBytes;
+    while (cut > 0 && (((uint8_t)s[cut]) & 0xC0) == 0x80) cut--;
+    return cut;
+}
+
+static void sha256Of(const uint8_t *data, size_t len, uint8_t out[32]) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, data, len);
+    mbedtls_md_finish(&ctx, out);
+    mbedtls_md_free(&ctx);
+}
+
 bool wrapStatelessCredential(const String &rpId, const uint8_t *userId, size_t userIdLen,
                              const String &userName, const String &privateKeyHex, int algId,
-                             uint8_t *outCredId, size_t &outCredIdLen) {
+                             uint8_t *outCredId, size_t outCapacity, size_t &outCredIdLen) {
+    outCredIdLen = 0;
+    if (!outCredId) return false;
+    if (userIdLen > STATELESS_MAX_USER_ID || (userIdLen > 0 && !userId)) return false;
+    if (privateKeyHex.length() == 0 || privateKeyHex.length() % 2 != 0 || privateKeyHex.length() / 2 > 0xFFFF) return false;
+
+    size_t privLen = privateKeyHex.length() / 2;
+    size_t nameLen = utf8SafeLength(userName, STATELESS_MAX_NAME);
+    size_t plainLen = 4 + 4 + 32 + 1 + userIdLen + 1 + nameLen + 2 + privLen;
+    size_t paddedLen = (plainLen + 15) & ~(size_t)15;
+    if (16 + paddedLen + 32 > outCapacity) return false;
+
     uint8_t aesKey[32], hmacKey[32];
     getStatelessMasterKeys(aesKey, hmacKey);
 
-    uint8_t rpHash[32];
-    mbedtls_md_context_t md_ctx;
-    mbedtls_md_init(&md_ctx);
-    mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&md_ctx);
-    mbedtls_md_update(&md_ctx, (const uint8_t*)rpId.c_str(), rpId.length());
-    mbedtls_md_finish(&md_ctx, rpHash);
-    mbedtls_md_free(&md_ctx);
-
-    size_t privLen = privateKeyHex.length() / 2;
-    size_t payloadBaseLen = 108 + privLen;
-    size_t paddedLen = (payloadBaseLen + 15) & ~15;
-
     uint8_t* plaintext = (uint8_t*)calloc(1, paddedLen);
-    if (!plaintext) return false;
+    if (!plaintext) { secureZero(aesKey, 32); secureZero(hmacKey, 32); return false; }
 
-    plaintext[0] = 'S'; plaintext[1] = 'T'; plaintext[2] = 'A'; plaintext[3] = 'T';
-
+    size_t off = 0;
+    memcpy(&plaintext[off], "STA2", 4); off += 4;
     int32_t netAlg = (int32_t)algId;
-    plaintext[4] = (netAlg >> 24) & 0xFF;
-    plaintext[5] = (netAlg >> 16) & 0xFF;
-    plaintext[6] = (netAlg >> 8) & 0xFF;
-    plaintext[7] = netAlg & 0xFF;
-
-    memcpy(&plaintext[8], rpHash, 32);
-
-    plaintext[40] = (uint8_t)(userIdLen > 32 ? 32 : userIdLen);
-    if (userId && userIdLen > 0) {
-        memcpy(&plaintext[41], userId, plaintext[40]);
+    plaintext[off++] = (netAlg >> 24) & 0xFF;
+    plaintext[off++] = (netAlg >> 16) & 0xFF;
+    plaintext[off++] = (netAlg >> 8) & 0xFF;
+    plaintext[off++] = netAlg & 0xFF;
+    sha256Of((const uint8_t*)rpId.c_str(), rpId.length(), &plaintext[off]); off += 32;
+    plaintext[off++] = (uint8_t)userIdLen;
+    if (userIdLen > 0) memcpy(&plaintext[off], userId, userIdLen);
+    off += userIdLen;
+    plaintext[off++] = (uint8_t)nameLen;
+    memcpy(&plaintext[off], userName.c_str(), nameLen); off += nameLen;
+    plaintext[off++] = (privLen >> 8) & 0xFF;
+    plaintext[off++] = privLen & 0xFF;
+    if (!hexDecodeStrict(privateKeyHex, &plaintext[off], privLen)) {
+        secureZero(plaintext, paddedLen); free(plaintext);
+        secureZero(aesKey, 32); secureZero(hmacKey, 32);
+        return false;
     }
-
-    uint8_t uNameLen = (uint8_t)(userName.length() > 32 ? 32 : userName.length());
-    plaintext[73] = uNameLen;
-    memcpy(&plaintext[74], userName.c_str(), uNameLen);
-
-    plaintext[106] = (privLen >> 8) & 0xFF;
-    plaintext[107] = privLen & 0xFF;
-    fromHex(privateKeyHex, &plaintext[108], privLen);
 
     uint8_t iv[16], iv_copy[16];
     esp_fill_random(iv, 16);
     memcpy(iv_copy, iv, 16);
 
     uint8_t* encrypted = (uint8_t*)malloc(paddedLen);
-    if (!encrypted) { free(plaintext); return false; }
+    if (!encrypted) {
+        secureZero(plaintext, paddedLen); free(plaintext);
+        secureZero(aesKey, 32); secureZero(hmacKey, 32);
+        return false;
+    }
 
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
@@ -1544,6 +1594,7 @@ bool wrapStatelessCredential(const String &rpId, const uint8_t *userId, size_t u
     mbedtls_aes_free(&aes);
 
     uint8_t hmac[32];
+    mbedtls_md_context_t md_ctx;
     mbedtls_md_init(&md_ctx);
     mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
     mbedtls_md_hmac_starts(&md_ctx, hmacKey, 32);
@@ -1557,21 +1608,24 @@ bool wrapStatelessCredential(const String &rpId, const uint8_t *userId, size_t u
     memcpy(&outCredId[16 + paddedLen], hmac, 32);
     outCredIdLen = 16 + paddedLen + 32;
 
+    secureZero(plaintext, paddedLen);
     free(plaintext);
     free(encrypted);
+    secureZero(aesKey, 32);
+    secureZero(hmacKey, 32);
     return true;
 }
 
 bool unwrapStatelessCredential(const uint8_t *credId, size_t credIdLen, const String &rpId,
                                String &outUserIdHex, String &outUserName,
                                String &outPrivateKeyHex, int &outAlgId) {
-    if (credIdLen < 123) return false;
-
-    uint8_t aesKey[32], hmacKey[32];
-    getStatelessMasterKeys(aesKey, hmacKey);
+    if (!credId || credIdLen < 16 + 16 + 32) return false;
 
     size_t encryptedLen = credIdLen - 48;
     if (encryptedLen % 16 != 0) return false;
+
+    uint8_t aesKey[32], hmacKey[32];
+    getStatelessMasterKeys(aesKey, hmacKey);
 
     const uint8_t* iv = &credId[0];
     const uint8_t* encrypted = &credId[16];
@@ -1586,11 +1640,12 @@ bool unwrapStatelessCredential(const uint8_t *credId, size_t credIdLen, const St
     mbedtls_md_hmac_update(&md_ctx, encrypted, encryptedLen);
     mbedtls_md_hmac_finish(&md_ctx, computedHmac);
     mbedtls_md_free(&md_ctx);
+    secureZero(hmacKey, 32);
 
-    if (memcmp(expectedHmac, computedHmac, 32) != 0) return false;
+    if (!constantTimeEqual(expectedHmac, computedHmac, 32)) { secureZero(aesKey, 32); return false; }
 
     uint8_t* plaintext = (uint8_t*)malloc(encryptedLen);
-    if (!plaintext) return false;
+    if (!plaintext) { secureZero(aesKey, 32); return false; }
 
     uint8_t iv_copy[16];
     memcpy(iv_copy, iv, 16);
@@ -1600,42 +1655,56 @@ bool unwrapStatelessCredential(const uint8_t *credId, size_t credIdLen, const St
     mbedtls_aes_setkey_dec(&aes, aesKey, 256);
     mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, encryptedLen, iv_copy, encrypted, plaintext);
     mbedtls_aes_free(&aes);
+    secureZero(aesKey, 32);
 
-    if (plaintext[0] != 'S' || plaintext[1] != 'T' || plaintext[2] != 'A' || plaintext[3] != 'T') {
-        free(plaintext);
-        return false;
-    }
-
+    bool ok = false;
     uint8_t expectedRpHash[32];
-    mbedtls_md_init(&md_ctx);
-    mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&md_ctx);
-    mbedtls_md_update(&md_ctx, (const uint8_t*)rpId.c_str(), rpId.length());
-    mbedtls_md_finish(&md_ctx, expectedRpHash);
-    mbedtls_md_free(&md_ctx);
+    sha256Of((const uint8_t*)rpId.c_str(), rpId.length(), expectedRpHash);
 
-    if (memcmp(&plaintext[8], expectedRpHash, 32) != 0) {
-        free(plaintext);
-        return false;
+    bool isV1 = encryptedLen >= 4 && memcmp(plaintext, "STAT", 4) == 0;
+    bool isV2 = encryptedLen >= 4 && memcmp(plaintext, "STA2", 4) == 0;
+
+    if (isV1 && encryptedLen >= STATELESS_V1_HEADER && constantTimeEqual(&plaintext[8], expectedRpHash, 32)) {
+        uint16_t pLen = (plaintext[106] << 8) | plaintext[107];
+        if (STATELESS_V1_HEADER + (size_t)pLen <= encryptedLen) {
+            outAlgId = (int)(((int32_t)plaintext[4] << 24) | ((int32_t)plaintext[5] << 16) | ((int32_t)plaintext[6] << 8) | plaintext[7]);
+            uint8_t uLen = plaintext[40] > 32 ? 32 : plaintext[40];
+            outUserIdHex = toHex(&plaintext[41], uLen);
+            uint8_t nLen = plaintext[73] > 32 ? 32 : plaintext[73];
+            char nameBuf[33] = {0};
+            memcpy(nameBuf, &plaintext[74], nLen);
+            outUserName = String(nameBuf);
+            outPrivateKeyHex = toHex(&plaintext[108], pLen);
+            ok = true;
+        }
+    } else if (isV2 && encryptedLen >= 4 + 4 + 32 + 1 && constantTimeEqual(&plaintext[8], expectedRpHash, 32)) {
+        size_t off = 40;
+        size_t uLen = plaintext[off++];
+        if (uLen <= STATELESS_MAX_USER_ID && off + uLen + 1 <= encryptedLen) {
+            const uint8_t *uid = &plaintext[off];
+            off += uLen;
+            size_t nLen = plaintext[off++];
+            if (nLen <= STATELESS_MAX_NAME && off + nLen + 2 <= encryptedLen) {
+                const uint8_t *nm = &plaintext[off];
+                off += nLen;
+                size_t pLen = ((size_t)plaintext[off] << 8) | plaintext[off + 1];
+                off += 2;
+                if (pLen > 0 && off + pLen <= encryptedLen) {
+                    outAlgId = (int)(((int32_t)plaintext[4] << 24) | ((int32_t)plaintext[5] << 16) | ((int32_t)plaintext[6] << 8) | plaintext[7]);
+                    outUserIdHex = toHex(uid, uLen);
+                    char nameBuf[STATELESS_MAX_NAME + 1] = {0};
+                    memcpy(nameBuf, nm, nLen);
+                    outUserName = String(nameBuf);
+                    outPrivateKeyHex = toHex(&plaintext[off], pLen);
+                    ok = true;
+                }
+            }
+        }
     }
 
-    int32_t netAlg = ((int32_t)plaintext[4] << 24) | ((int32_t)plaintext[5] << 16) | ((int32_t)plaintext[6] << 8) | plaintext[7];
-    outAlgId = (int)netAlg;
-
-    uint8_t uLen = plaintext[40] > 32 ? 32 : plaintext[40];
-    outUserIdHex = toHex(&plaintext[41], uLen);
-
-    uint8_t nLen = plaintext[73] > 32 ? 32 : plaintext[73];
-    char nameBuf[33] = {0};
-    memcpy(nameBuf, &plaintext[74], nLen);
-    outUserName = String(nameBuf);
-
-    uint16_t pLen = (plaintext[106] << 8) | plaintext[107];
-    if (108 + pLen > encryptedLen) { free(plaintext); return false; }
-    outPrivateKeyHex = toHex(&plaintext[108], pLen);
-
+    secureZero(plaintext, encryptedLen);
     free(plaintext);
-    return true;
+    return ok;
 }
 
 static void getStatelessMasterSecret(uint8_t secretOut[32]) {

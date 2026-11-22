@@ -1,6 +1,8 @@
 #include "DisplayManager.h"
 #include "Globals.h"
 
+#if FEATURE_OLED
+
 // SSD1306 128x32 display on a 4-wire software SPI bus.
 U8G2_SSD1306_128X32_UNIVISION_F_4W_SW_SPI u8g2(U8G2_R0, 12, 11, 10, 9, 13);
 
@@ -129,3 +131,16 @@ void clearDisplay() {
     u8g2.sendBuffer();
     xSemaphoreGive(displayMutex);
 }
+
+#else
+
+void showDisplayMessage(int lines, String text1, String text2, unsigned long timeoutMs, bool requireStay) {
+    (void)lines; (void)text1; (void)text2; (void)requireStay;
+    if (timeoutMs > 0) {
+        vTaskDelay(timeoutMs / portTICK_PERIOD_MS);
+    }
+}
+
+void clearDisplay() {}
+
+#endif

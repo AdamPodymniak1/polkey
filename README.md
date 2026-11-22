@@ -166,6 +166,27 @@ This project is built for the ESP32-S3 microcontroller. It requires an SSD1306 S
 
 ---
 
+## Firmware Variants (choose at flash time)
+
+Each variant is a PlatformIO environment named `<fido|pm>-<fp|btn>-<oled|nooled>`:
+
+| Choice | Option A | Option B |
+|---|---|---|
+| Features | `pm` = FIDO2 + password manager/TOTP | `fido` = FIDO2 only |
+| User auth | `fp` = fingerprint sensor (UP + UV) | `btn` = push button on **GPIO8** to GND (UP only) |
+| Display | `oled` = SSD1306 fitted | `nooled` = headless |
+
+```
+pio run -e fido-btn-nooled -t upload     # example: FIDO-only, button, no OLED
+pio run -e pm-fp-oled -t upload          # full device (same as the default esp32s3 env)
+```
+
+`esp32s3` is the full device; `esp32s3-bench` is the full device plus the bench-only attestation provisioning command.
+The flags are defined in `include/FeatureConfig.h` and can also be passed as `-D` options.
+
+**Button variant behaviour:** a button press is *user presence only*. The firmware never sets the UV flag, does not advertise `uv`, `alwaysUv` or `bioEnroll` in `authenticatorGetInfo`, rejects `uv=true` requests with `CTAP2_ERR_UNSUPPORTED_OPTION`, treats credProtect level 2/3 credentials that need UV as unavailable, honours `up=false` (no press required, UP flag clear), and requires a fresh press for every assertion. Fingerprint enrollment commands are not available.
+**FIDO-only variant:** the `SAVE/GET/SHOW/UPDATE/DELETE/LIST_PASS` and `*_TOTP` commands are not compiled in. `help` reports the active `features`.
+
 ## FIDO2 Attestation Certificate Provisioning
 
 Polkey presents an X.509 batch attestation certificate during legacy U2F/CTAP1 registration, so relying parties can verify the credential came from genuine Polkey hardware rather than an arbitrary software authenticator. The certificate chain and its matching EC P-256 private key are stored in the ESP32's NVS (`fido_attest` namespace) — **never compiled into the firmware source**, and never committed to this repository.

@@ -104,6 +104,10 @@ bool testStorageSubsystem() {
 }
 
 bool testDisplaySubsystem() {
+#if !FEATURE_OLED
+    printTestResult("Hardware: OLED (not fitted in this build, skipped)", true);
+    return true;
+#endif
     showDisplayMessage(1, "TEST", "", 300);
     showDisplayMessage(1, "TEST", "", 300);
 
@@ -112,7 +116,7 @@ bool testDisplaySubsystem() {
 }
 
 bool testFingerprintSubsystem() {
-#if USE_FINGERPRINT_SIMULATOR
+#if AUTH_BUTTON_ONLY
     printTestResult("Hardware: Optical Biometric UART Connection Handshake", true);
     return true;
 #else

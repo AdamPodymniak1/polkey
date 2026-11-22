@@ -6,8 +6,7 @@
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
 
-#define USE_FINGERPRINT_SIMULATOR 0
-#define SIMULATOR_BUTTON_PIN 4
+#include "FeatureConfig.h"
 
 enum SystemState {
     STATE_READY,

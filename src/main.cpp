@@ -113,32 +113,45 @@ void cliTask(void *pvParameters) {
 
             if (cmd == "help") {
                 JsonDocument data;
-                data["commands"][0] = "SAVE_PASS";
-                data["commands"][1] = "GET_PASS";
-                data["commands"][2] = "DELETE_PASS";
-                data["commands"][3] = "LIST_PASS";
-                data["commands"][4] = "SAVE_TOTP";
-                data["commands"][5] = "GET_TOTP";
-                data["commands"][6] = "DELETE_TOTP";
-                data["commands"][7] = "LIST_FIDO";
-                data["commands"][8] = "DELETE_FIDO";
-                data["commands"][9] = "STORAGE_INFO";
-                data["commands"][10] = "PURGE_STORAGE";
-                data["commands"][11] = "RUN_DIAGNOSTICS";
-                data["commands"][12] = "UPDATE_SETTINGS";
-                data["commands"][13] = "UPDATE_PASS";
-                data["commands"][14] = "SET_CRYPTO_ALG";
-                data["commands"][15] = "ENROLL_FINGERPRINT";
-                data["commands"][16] = "FACTORY_RESET";
-                data["commands"][17] = "UPDATE_PIN";
-                data["commands"][18] = "BACKUP_EXPORT";
-                data["commands"][19] = "BACKUP_IMPORT_BEGIN";
-                data["commands"][20] = "BACKUP_IMPORT_CHUNK";
-                data["commands"][21] = "BACKUP_IMPORT_COMMIT";
-                data["commands"][22] = "BACKUP_IMPORT_ABORT";
-                data["commands"][23] = "SHOW_PASS";
+                JsonArray cmds = data["commands"].to<JsonArray>();
+#if FEATURE_PASSWORD_MANAGER
+                cmds.add("SAVE_PASS");
+                cmds.add("GET_PASS");
+                cmds.add("DELETE_PASS");
+                cmds.add("LIST_PASS");
+                cmds.add("SAVE_TOTP");
+                cmds.add("GET_TOTP");
+                cmds.add("DELETE_TOTP");
+#endif
+                cmds.add("LIST_FIDO");
+                cmds.add("DELETE_FIDO");
+                cmds.add("STORAGE_INFO");
+                cmds.add("PURGE_STORAGE");
+                cmds.add("RUN_DIAGNOSTICS");
+                cmds.add("UPDATE_SETTINGS");
+#if FEATURE_PASSWORD_MANAGER
+                cmds.add("UPDATE_PASS");
+#endif
+                cmds.add("SET_CRYPTO_ALG");
+#if HAS_FINGERPRINT
+                cmds.add("ENROLL_FINGERPRINT");
+#endif
+                cmds.add("FACTORY_RESET");
+                cmds.add("UPDATE_PIN");
+                cmds.add("BACKUP_EXPORT");
+                cmds.add("BACKUP_IMPORT_BEGIN");
+                cmds.add("BACKUP_IMPORT_CHUNK");
+                cmds.add("BACKUP_IMPORT_COMMIT");
+                cmds.add("BACKUP_IMPORT_ABORT");
+#if FEATURE_PASSWORD_MANAGER
+                cmds.add("SHOW_PASS");
+#endif
+                data["features"]["password_manager"] = (bool)FEATURE_PASSWORD_MANAGER;
+                data["features"]["oled"] = (bool)FEATURE_OLED;
+                data["features"]["user_auth"] = AUTH_BUTTON_ONLY ? "button" : "fingerprint";
                 CommsManager::sendEvent("SYS", "HELP_MENU", &data);
             } 
+#if FEATURE_PASSWORD_MANAGER
             else if (cmd == "SAVE_PASS" || cmd == "create") {
                 String website = req["site"] | req["website"] | "";
                 String login = req["login"] | "";
@@ -228,6 +241,7 @@ void cliTask(void *pvParameters) {
                     CommsManager::sendError("TOTP", "NOT_FOUND");
                 }
             }
+#endif
             else if (cmd == "LIST_FIDO") {
                 listFidoWebsites();
             }
@@ -262,6 +276,7 @@ void cliTask(void *pvParameters) {
                 data["algId"] = defaultCryptoAlg;
                 CommsManager::sendEvent("SYS", "SETTINGS_UPDATED", &data);
             }
+#if FEATURE_PASSWORD_MANAGER
             else if (cmd == "UPDATE_PASS" || cmd == "update") {
                 String website = req["site"] | req["website"] | "";
                 String login = req["login"] | "";
@@ -288,6 +303,8 @@ void cliTask(void *pvParameters) {
                 showDisplayMessage(2, "AUTH TO UPDATE:", website, 0);
                 CommsManager::sendEvent("PASS", "AWAITING_HARDWARE_APPROVAL");
             }
+#endif
+#if HAS_FINGERPRINT
             else if (cmd == "ENROLL_FINGER") {
                 uint8_t id = req["id"] | 1;
                 if (enrollFingerprint(id)) {
@@ -296,6 +313,7 @@ void cliTask(void *pvParameters) {
                     CommsManager::sendError("AUTH", "ENROLL_FAILED");
                 }
             }
+#endif
 #ifdef ALLOW_ATTESTATION_PROVISIONING_CMD
             else if (cmd == "PROVISION_ATTESTATION") {
                 String privHex = req["privkey"] | "";
@@ -397,9 +415,11 @@ void setup() {
     
     cryptoQueue = xQueueCreate(2, sizeof(CryptoRequest));
 
+#if FEATURE_OLED
     xSemaphoreTake(displayMutex, portMAX_DELAY);
     u8g2.begin();
     xSemaphoreGive(displayMutex);
+#endif
 
     showDisplayMessage(1, "BOOTING...", "", 0);
 

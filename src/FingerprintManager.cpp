@@ -14,13 +14,13 @@ static bool fingerprintReady = false;
 static unsigned long fingerprintLastUseMs = 0;
 
 void fingerprintKeepAlive() {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     fingerprintLastUseMs = millis();
 #endif
 }
 
 static void fingerprintRailOffLocked() {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     if (!fingerprintPowered) return;
 
     mySerial.end();
@@ -35,7 +35,7 @@ static void fingerprintRailOffLocked() {
 }
 
 bool fingerprintPowerOn() {
-#if USE_FINGERPRINT_SIMULATOR
+#if AUTH_BUTTON_ONLY
     return true;
 #else
     fingerprintKeepAlive();
@@ -68,7 +68,7 @@ bool fingerprintPowerOn() {
 }
 
 void fingerprintPowerOff() {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     fingerprintRailOffLocked();
     xSemaphoreGive(fingerprintMutex);
@@ -76,7 +76,7 @@ void fingerprintPowerOff() {
 }
 
 void fingerprintPowerIdleCheck() {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     if (!fingerprintPowered) return;
     if (millis() - fingerprintLastUseMs < FINGERPRINT_IDLE_POWER_OFF_MS) return;
 
@@ -90,7 +90,7 @@ void fingerprintPowerIdleCheck() {
 }
 
 void setFingerprintLed(bool on) {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     if (on) {
         fingerprintPowerOn();
     }
@@ -110,9 +110,9 @@ void setFingerprintLed(bool on) {
 }
 
 void initFingerprintSensor() {
-#if USE_FINGERPRINT_SIMULATOR
-    pinMode(SIMULATOR_BUTTON_PIN, INPUT_PULLUP);
-    CommsManager::sendEvent("SYS", "FP_SIM_READY");
+#if AUTH_BUTTON_ONLY
+    pinMode(AUTH_BUTTON_PIN, INPUT_PULLUP);
+    CommsManager::sendEvent("SYS", "BUTTON_READY");
 #else
     if (fingerprintPowerOn()) {
         CommsManager::sendEvent("SYS", "FP_READY");
@@ -126,16 +126,16 @@ void initFingerprintSensor() {
 }
 
 bool enrollFingerprint(uint8_t id) {
-#if USE_FINGERPRINT_SIMULATOR
+#if AUTH_BUTTON_ONLY
     showDisplayMessage(1, "Press Button 1", "", 0);
 
-    while(digitalRead(SIMULATOR_BUTTON_PIN) == HIGH) { vTaskDelay(50 / portTICK_PERIOD_MS); }
-    while(digitalRead(SIMULATOR_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
+    while(digitalRead(AUTH_BUTTON_PIN) == HIGH) { vTaskDelay(50 / portTICK_PERIOD_MS); }
+    while(digitalRead(AUTH_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
 
     showDisplayMessage(1, "Press Button 2", "", 0);
 
-    while(digitalRead(SIMULATOR_BUTTON_PIN) == HIGH) { vTaskDelay(50 / portTICK_PERIOD_MS); }
-    while(digitalRead(SIMULATOR_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
+    while(digitalRead(AUTH_BUTTON_PIN) == HIGH) { vTaskDelay(50 / portTICK_PERIOD_MS); }
+    while(digitalRead(AUTH_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
 
     showDisplayMessage(1, "STORED OK", "", 2000);
     return true;
@@ -226,9 +226,9 @@ void updateFingerprintAsync() {
     fingerprintPowerIdleCheck();
     if (currentCommandState != STATE_AWAITING_FINGERPRINT && currentCommandState != STATE_AWAITING_FINGERPRINT_UPDATE && currentCommandState != STATE_AWAITING_FINGERPRINT_SHOW) return;
 
-#if USE_FINGERPRINT_SIMULATOR
-    if (digitalRead(SIMULATOR_BUTTON_PIN) == LOW) {
-        while(digitalRead(SIMULATOR_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
+#if AUTH_BUTTON_ONLY
+    if (digitalRead(AUTH_BUTTON_PIN) == LOW) {
+        while(digitalRead(AUTH_BUTTON_PIN) == LOW) { vTaskDelay(50 / portTICK_PERIOD_MS); }
         if (currentCommandState == STATE_AWAITING_FINGERPRINT_UPDATE) {
             deletePassword(pendingWebsite, pendingLogin);
             if (savePassword(pendingWebsite, pendingLogin, pendingPasswordToSave)) {
@@ -382,7 +382,7 @@ void updateFingerprintAsync() {
 }
 
 void deleteAllFingerprints() {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
     fingerprintPowerOn();
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     finger.emptyDatabase();

@@ -1,0 +1,90 @@
+#ifndef STORAGE_MANAGER_H
+#define STORAGE_MANAGER_H
+
+#include <Arduino.h>
+#include <vector>
+
+void deriveStorageKey(const String &pin);
+void clearStorageKey();
+
+bool initStorage();
+String hashPin(const String &pin);
+bool isPinSet();
+bool createPin(const String &pin);
+bool verifyPin(const String &pin);
+int getFailedPinAttempts();
+void incrementFailedPinAttempts();
+void resetFailedPinAttempts();
+
+void factoryResetSystem();
+
+bool isPasswordExists(const String &website, const String &login);
+bool savePassword(const String &website, const String &login, const String &password);
+String getPasswordFromStorage(const String &website, const String &login);
+bool deletePassword(const String &website, const String &login);
+void listPasswords();
+void showStorageInfo();
+bool deletePin();
+void clearAllStoredPasswords();
+
+bool isPasskeyExists(const String &credentialIdHex);
+bool savePasskeyRecord(const String &credentialIdHex, const String &rpId, const String &userIdHex, const String &userName, const String &privateKeyHex, int algId);
+bool savePasskeyRecord(const String &credentialIdHex, const String &rpId, const String &userIdHex, const String &userName, const String &privateKeyHex, int algId, int credProtect, const String &largeBlobKeyHex);
+bool savePasskeyRecord(const String &credentialIdHex, const String &rpId, const String &userIdHex, const String &userName, const String &privateKeyHex, int algId, int credProtect, const String &largeBlobKeyHex, const String &credBlobHex);
+bool getPasskeyRecord(const String &credentialIdHex, String &rpIdOut, String &userIdHexOut, String &userNameOut, String &privateKeyHexOut, int &algId);
+bool getPasskeyRecord(const String &credentialIdHex, String &rpIdOut, String &userIdHexOut, String &userNameOut, String &privateKeyHexOut, int &algId, int &credProtectOut, String &largeBlobKeyHexOut);
+bool getPasskeyRecord(const String &credentialIdHex, String &rpIdOut, String &userIdHexOut, String &userNameOut, String &privateKeyHexOut, int &algId, int &credProtectOut, String &largeBlobKeyHexOut, String &credBlobHexOut);
+String findCredentialIdByRpAndUser(const String &rpId, const String &userIdHex);
+
+bool getLargeBlobArray(uint8_t **outData, size_t &outLen);
+bool setLargeBlobArray(const uint8_t *data, size_t len);
+
+size_t getBinaryCredentialId(const String &rpId, const String &userIdHex, uint8_t *outBuffer, size_t maxOutLen);
+
+void listFidoWebsites();
+bool deleteFidoWebsite(const String &rpId);
+String getFidoWebsiteInfo(const String &rpId);
+
+void saveTotpSecret(const String &name, const String &secret);
+String getTotpSecret(const String &name);
+void handleTotpGetAll(uint32_t currentEpoch);
+bool deleteTotpSecret(const String &name);
+
+void saveDefaultCryptoAlg(int algId);
+int loadDefaultCryptoAlg();
+
+void secureWipe(String &str);
+
+bool isFidoPinSet();
+bool createFidoPin(const String &pin);
+int getFailedFidoPinAttempts();
+void resetFido2System();
+std::vector<String> findAllCredentialsByRp(const String &rpId);
+std::vector<String> getAllStoredCredentialIds();
+std::vector<String> getAllStoredRpIds();
+bool deletePasskeyRecord(const String &credentialIdHex);
+bool wrapStatelessCredential(const String &rpId, const uint8_t *userId, size_t userIdLen, const String &userName, const String &privateKeyHex, int algId, uint8_t *outCredId, size_t &outCredIdLen);
+bool unwrapStatelessCredential(const uint8_t *credId, size_t credIdLen, const String &rpId, String &outUserIdHex, String &outUserName, String &outPrivateKeyHex, int &outAlgId);
+void rotateStatelessMasterSecret();
+static void getStatelessMasterSecret(uint8_t secretOut[32]);
+void rotateStatelessMasterSecret();
+
+bool getForcePinChange();
+void setForcePinChange(bool force);
+uint8_t getMinPinLength();
+void setMinPinLength(uint8_t length);
+int getFailedUvAttempts();
+void incrementFailedUvAttempts();
+void resetFailedUvAttempts();
+void incrementFailedFidoPinAttempts();
+void resetFailedFidoPinAttempts();
+bool verifyFidoPinInternal(const String& pin);
+
+bool isAttestationProvisioned();
+bool loadAttestationCertChain(uint8_t* buf, size_t bufCap, size_t* outLen);
+bool saveAttestationCertChain(const uint8_t* buf, size_t len);
+bool loadAttestationPrivateKey(uint8_t privKeyOut[32]);
+bool saveAttestationPrivateKey(const uint8_t privKey[32]);
+bool eraseAttestationProvisioning();
+
+#endif

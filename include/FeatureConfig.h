@@ -1,0 +1,41 @@
+#ifndef FEATURE_CONFIG_H
+#define FEATURE_CONFIG_H
+
+#ifndef FEATURE_OLED
+#define FEATURE_OLED 1
+#endif
+
+#ifndef FEATURE_PASSWORD_MANAGER
+#define FEATURE_PASSWORD_MANAGER 1
+#endif
+
+#if defined(USER_AUTH_FINGERPRINT) && defined(USER_AUTH_BUTTON)
+#error "Select only one of USER_AUTH_FINGERPRINT or USER_AUTH_BUTTON"
+#endif
+#if !defined(USER_AUTH_FINGERPRINT) && !defined(USER_AUTH_BUTTON)
+#define USER_AUTH_FINGERPRINT
+#endif
+
+#ifdef USER_AUTH_BUTTON
+#define AUTH_BUTTON_ONLY 1
+#define HAS_FINGERPRINT 0
+#else
+#define AUTH_BUTTON_ONLY 0
+#define HAS_FINGERPRINT 1
+#endif
+
+#ifndef AUTH_BUTTON_PIN
+#define AUTH_BUTTON_PIN 8
+#endif
+
+#if AUTH_BUTTON_ONLY
+#define UI_PROMPT_PLACE  "PRESS BUTTON"
+#define UI_PROMPT_VERIFY "PRESS BUTTON"
+#define UI_PROMPT_TOUCH  "PRESS BUTTON"
+#else
+#define UI_PROMPT_PLACE  "PLACE FINGER"
+#define UI_PROMPT_VERIFY "VERIFY FINGER"
+#define UI_PROMPT_TOUCH  "TOUCH SENSOR"
+#endif
+
+#endif

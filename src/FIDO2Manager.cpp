@@ -191,9 +191,9 @@ bool fidoVerifyFingerprint() {
         return false;
     }
 
-#if USE_FINGERPRINT_SIMULATOR
-    if (digitalRead(SIMULATOR_BUTTON_PIN) == LOW) {
-        while(digitalRead(SIMULATOR_BUTTON_PIN) == LOW) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+#if AUTH_BUTTON_ONLY
+    if (digitalRead(AUTH_BUTTON_PIN) == LOW) {
+        while(digitalRead(AUTH_BUTTON_PIN) == LOW) { vTaskDelay(10 / portTICK_PERIOD_MS); }
         fidoLogf("UV", "simulator button press -> OK");
         resetFailedUvAttempts();
         return true;
@@ -715,7 +715,11 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         encoder.writeByteString(dynamicAaguid, 16);
 
         encoder.writeUnsignedInt(4);
+#if AUTH_BUTTON_ONLY
+        encoder.writeMapHeader(7);
+#else
         encoder.writeMapHeader(11);
+#endif
 
         bool hasBioEnrollments = (getBioTemplateCount() > 0);
 
@@ -732,15 +736,15 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         // credentialMgmtPreview (21) / userVerificationMgmtPreview (27).
         encoder.writeTextString("rk"); encoder.writeBoolean(true);
         encoder.writeTextString("up"); encoder.writeBoolean(true);
-        #if USE_FINGERPRINT_SIMULATOR
-        encoder.writeTextString("uv"); encoder.writeBoolean(false);
-        #else
+#if !AUTH_BUTTON_ONLY
         encoder.writeTextString("uv"); encoder.writeBoolean(hasBioEnrollments);
-        #endif
         encoder.writeTextString("alwaysUv"); encoder.writeBoolean(true);
+#endif
         encoder.writeTextString("credMgmt"); encoder.writeBoolean(true);
 
+#if !AUTH_BUTTON_ONLY
         encoder.writeTextString("bioEnroll"); encoder.writeBoolean(hasBioEnrollments);
+#endif
         encoder.writeTextString("clientPin"); encoder.writeBoolean(isFidoPinSet());
 
         encoder.writeTextString("largeBlobs"); encoder.writeBoolean(true);
@@ -749,7 +753,9 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
         encoder.writeTextString("credentialMgmtPreview"); encoder.writeBoolean(true);
 
+#if !AUTH_BUTTON_ONLY
         encoder.writeTextString("userVerificationMgmtPreview"); encoder.writeBoolean(hasBioEnrollments);
+#endif
 
         encoder.writeUnsignedInt(5); encoder.writeUnsignedInt(8192);
 
@@ -820,6 +826,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
     }
     else if (ctap2Cmd == 0x01) {
         bool optionRK = false;
+        bool mcOptionUV = false;
         char targetRpId[128] = {0};
         uint8_t clientDataHash[32] = {0};
         size_t clientDataHashLen = 0;
@@ -1002,6 +1009,11 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                                     if (parser.readTypeAndValue(valType, valVal) && valType == 7) {
                                         optionRK = (valVal == 21);
                                     } else { parser.skipValue(); }
+                                } else if (strcmp(optKey, "uv") == 0) {
+                                    uint8_t valType; uint64_t valVal;
+                                    if (parser.readTypeAndValue(valType, valVal) && valType == 7) {
+                                        mcOptionUV = (valVal == 21);
+                                    } else { parser.skipValue(); }
                                 } else { parser.skipValue(); }
                             } else { parser.skipValue(); }
                         }
@@ -1013,6 +1025,14 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
         }
 
+#if AUTH_BUTTON_ONLY
+        if (mcOptionUV) {
+            uint8_t err = 0x2B;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
+#endif
         if (strlen(targetRpId) == 0 || userIdLen == 0 || clientDataHashLen != 32) {
             uint8_t err = 0x0A;
             sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
@@ -1036,7 +1056,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
         }
 
-        showDisplayMessage(1, "PLACE FINGER", "", 0);
+        showDisplayMessage(1, UI_PROMPT_PLACE, "", 0);
 
         bool biometricVerified = false;
         bool biometricCanceled = false;
@@ -1238,7 +1258,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
         } else {
             bool wrapOk = wrapStatelessCredential(String(targetRpId), userIdRaw, userIdLen, String(userName),
-                              privateKeyHex, selectedAlgId, rawCredId, rawCredIdLen);
+                              privateKeyHex, selectedAlgId, rawCredId, sizeof(rawCredId), rawCredIdLen);
             if (!wrapOk) {
                 showDisplayMessage(1, "WRAP FAILED", "", 0);
                 uint8_t err = 0x01;
@@ -1270,7 +1290,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         mbedtls_md_finish(&sha_ctx, &authData[0]);
         mbedtls_md_free(&sha_ctx);
 
-        uint8_t authDataFlags = 0x45;
+        uint8_t authDataFlags = AUTH_BUTTON_ONLY ? 0x41 : 0x45;
         if (hmacSecretRequested || credBlobRequested) {
             authDataFlags |= 0x80;
         }
@@ -1644,9 +1664,24 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         bool credProtectRequiresUv = (storedCredProtect == 3) ||
                                       (storedCredProtect == 2 && !resolvedViaAllowList);
 
+#if AUTH_BUTTON_ONLY
+        if (optionUV) {
+            uint8_t err = 0x2B;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
+        if (credProtectRequiresUv) {
+            uint8_t err = 0x2E;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
+#else
         optionUP = true;
         optionUV = true;
         (void)credProtectRequiresUv;
+#endif
 
         nextAssertionCreds = matchedCreds;
         nextAssertionIdx = 1;
@@ -1666,10 +1701,10 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
         bool biometricVerified = false;
         if (optionUP || optionUV) {
-            if (lastFingerprintSuccessTime > 0 && millis() - lastFingerprintSuccessTime < 5000) {
+            if (!AUTH_BUTTON_ONLY && lastFingerprintSuccessTime > 0 && millis() - lastFingerprintSuccessTime < 5000) {
                 biometricVerified = true;
             } else {
-                showDisplayMessage(1, "VERIFY FINGER", "", 0);
+                showDisplayMessage(1, UI_PROMPT_VERIFY, "", 0);
 
                 bool biometricCanceled = false;
                 unsigned long authStart = millis();
@@ -1689,7 +1724,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                     }
                     if (fidoVerifyFingerprint()) {
                         biometricVerified = true;
-                        lastFingerprintSuccessTime = millis();
+                        if (!AUTH_BUTTON_ONLY) lastFingerprintSuccessTime = millis();
                         break;
                     }
                     delay(50);
@@ -1725,7 +1760,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
         uint8_t flags = 0x00;
         if (optionUP || optionUV) { flags |= 0x01; }
-        if (biometricVerified && (optionUP || optionUV)) { flags |= 0x04; }
+        if (!AUTH_BUTTON_ONLY && biometricVerified && (optionUP || optionUV)) { flags |= 0x04; }
         if (extensionRequested) { flags |= 0x80; }
         authData[32] = flags;
 
@@ -2161,7 +2196,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         return;
     }
     else if (ctap2Cmd == 0x07) {
-        showDisplayMessage(1, "RESET FIDO2", "TOUCH SENSOR", 0);
+        showDisplayMessage(1, "RESET FIDO2", UI_PROMPT_TOUCH, 0);
 
         bool biometricVerified = false;
         bool biometricCanceled = false;
@@ -2815,7 +2850,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                                            millis() - lastFingerprintSuccessTime < 5000);
 
                 if (!biometricVerified) {
-                    showDisplayMessage(1, "VERIFY FINGER", "", 0);
+                    showDisplayMessage(1, UI_PROMPT_VERIFY, "", 0);
 
                     bool biometricCanceled = false;
                     unsigned long authStart = millis();
@@ -2835,7 +2870,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                         }
                         if (fidoVerifyFingerprint()) {
                             biometricVerified = true;
-                            lastFingerprintSuccessTime = millis();
+                            if (!AUTH_BUTTON_ONLY) lastFingerprintSuccessTime = millis();
                             break;
                         }
                         delay(50);
@@ -3013,6 +3048,12 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         return;
     }
     else if (ctap2Cmd == 0x09 || ctap2Cmd == 0x40) {
+#if AUTH_BUTTON_ONLY
+        uint8_t err = 0x01;
+        sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+        free(responseBuffer);
+        return;
+#endif
         static bool bioEnrollActive = false;
         static uint8_t bioEnrollTemplateId = 0;
         static uint8_t bioEnrollSamplesRequired = 2;
@@ -3027,7 +3068,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             unsigned long waitStart = millis();
             unsigned long lastKeepAlive = 0;
 
-#if USE_FINGERPRINT_SIMULATOR
+#if AUTH_BUTTON_ONLY
             bool touched = false;
             while (millis() - waitStart < 15000) {
                 if (hasPendingCommand && pendingCmd == CTAPHID_CANCEL && pendingChannel == channel) {
@@ -3040,8 +3081,8 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                     sendCtapResponse(channel, CTAPHID_KEEPALIVE, &status, 1);
                     lastKeepAlive = millis();
                 }
-                if (digitalRead(SIMULATOR_BUTTON_PIN) == LOW) {
-                    while (digitalRead(SIMULATOR_BUTTON_PIN) == LOW) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+                if (digitalRead(AUTH_BUTTON_PIN) == LOW) {
+                    while (digitalRead(AUTH_BUTTON_PIN) == LOW) { vTaskDelay(10 / portTICK_PERIOD_MS); }
                     touched = true;
                     break;
                 }
@@ -3083,7 +3124,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             bioEnrollSamplesRemaining = (bioEnrollSamplesRemaining > 0) ? bioEnrollSamplesRemaining - 1 : 0;
 
             if (bioEnrollSamplesRemaining > 0) {
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
                 showDisplayMessage(1, "Remove finger", "", 0);
                 uint8_t p = 0;
                 unsigned long t0 = millis();
@@ -3098,7 +3139,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 return 0x00;
             }
 
-#if USE_FINGERPRINT_SIMULATOR
+#if AUTH_BUTTON_ONLY
             outFinished = true;
             return 0x00;
 #else
@@ -3334,7 +3375,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         else if (subCommand == 0x04) {
             bool verified = (lastFingerprintSuccessTime > 0 && millis() - lastFingerprintSuccessTime < 5000);
             if (!verified) {
-                showDisplayMessage(1, "VERIFY FINGER", "", 0);
+                showDisplayMessage(1, UI_PROMPT_VERIFY, "", 0);
                 bool canceled = false;
                 unsigned long authStart = millis();
                 unsigned long lastKeepAlive = 0;
@@ -3351,7 +3392,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                     }
                     if (fidoVerifyFingerprint()) {
                         verified = true;
-                        lastFingerprintSuccessTime = millis();
+                        if (!AUTH_BUTTON_ONLY) lastFingerprintSuccessTime = millis();
                         break;
                     }
                     delay(50);
@@ -3435,7 +3476,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
-#if !USE_FINGERPRINT_SIMULATOR
+#if !AUTH_BUTTON_ONLY
             fingerprintPowerOn();
             xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
             finger.deleteModel(targetId);
