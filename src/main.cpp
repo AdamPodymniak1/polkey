@@ -102,6 +102,7 @@ void cliTask(void *pvParameters) {
                     if (verifyPin(pinInput)) {
                         authenticated = true;
                         deriveStorageKey(pinInput);
+                        upgradeVaultKdf(pinInput);
                         showDisplayMessage(1, "ACCESS GRANTED", "", 0);
                         CommsManager::sendEvent("SECURITY", "PIN_OK");
                     }
@@ -126,6 +127,7 @@ void cliTask(void *pvParameters) {
                 cmds.add("LIST_FIDO");
                 cmds.add("DELETE_FIDO");
                 cmds.add("STORAGE_INFO");
+                cmds.add("SECURITY_STATUS");
                 cmds.add("PURGE_STORAGE");
                 cmds.add("RUN_DIAGNOSTICS");
                 cmds.add("UPDATE_SETTINGS");
@@ -252,6 +254,16 @@ void cliTask(void *pvParameters) {
                 } else {
                     CommsManager::sendError("FIDO2", "NOT_FOUND");
                 }
+            }
+            else if (cmd == "SECURITY_STATUS") {
+                bool flashEnc, secBoot, hmacKey;
+                getFidoSecurityStatus(flashEnc, secBoot, hmacKey);
+                JsonDocument data;
+                data["flash_encryption"] = flashEnc;
+                data["secure_boot"] = secBoot;
+                data["efuse_hmac_key"] = hmacKey;
+                data["passkey_key_source"] = hmacKey ? "efuse_hmac" : "nvs_secret";
+                CommsManager::sendEvent("SECURITY", "STATUS", &data);
             }
             else if (cmd == "STORAGE_INFO") {
                 showStorageInfo();
@@ -389,8 +401,11 @@ void cliTask(void *pvParameters) {
                 }
 
                 if (verifyPin(currentPin)) {
-                    if (createPin(newPin)) {
-                        deriveStorageKey(newPin);
+                    if (newPin.length() < getMinPinLength()) {
+                        CommsManager::sendError("AUTH", "PIN_TOO_SHORT");
+                    } else if (!rekeyVaultForNewPin(newPin)) {
+                        CommsManager::sendError("AUTH", "REKEY_FAILED");
+                    } else if (createPin(newPin)) {
                         CommsManager::sendEvent("AUTH", "PIN_UPDATED");
                     } else {
                         CommsManager::sendError("AUTH", "PIN_TOO_SHORT");

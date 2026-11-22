@@ -187,6 +187,17 @@ The flags are defined in `include/FeatureConfig.h` and can also be passed as `-D
 **Button variant behaviour:** a button press is *user presence only*. The firmware never sets the UV flag, does not advertise `uv`, `alwaysUv` or `bioEnroll` in `authenticatorGetInfo`, rejects `uv=true` requests with `CTAP2_ERR_UNSUPPORTED_OPTION`, treats credProtect level 2/3 credentials that need UV as unavailable, honours `up=false` (no press required, UP flag clear), and requires a fresh press for every assertion. Fingerprint enrollment commands are not available.
 **FIDO-only variant:** the `SAVE/GET/SHOW/UPDATE/DELETE/LIST_PASS` and `*_TOTP` commands are not compiled in. `help` reports the active `features`.
 
+## Storage Security
+
+What the firmware does by itself:
+
+- **Passkey key:** passkeys are AES-GCM encrypted with a key that is no longer derived from the MAC address. A random per-device secret stored in NVS is used (an HMAC key already present in eFuse would be used instead, the firmware never writes eFuses). Existing devices are migrated automatically at boot (`fido_ks` in NVS records the active key source, migration is idempotent and restart-safe).
+- **PIN:** stored as `P2$<salt>$PBKDF2-HMAC-SHA256(SHA256(pin)[:16], salt)` with a random per-device salt. The 16-byte prehash is what CTAP `clientPin` sends, so FIDO and serial PIN checks share one record. Old unsalted hashes are upgraded on the next successful PIN check.
+- **Vault key:** the password/TOTP key uses a random per-device salt stored in NVS instead of a constant. Existing vaults are re-encrypted on the first unlock, and `UPDATE_PIN` now re-encrypts the vault under the new PIN with a fresh salt. The rewrite goes through temp files and an NVS commit flag, and is finished or discarded at boot after a power loss.
+- `SECURITY_STATUS` reports `flash_encryption`, `secure_boot`, `efuse_hmac_key` and the active passkey key source.
+
+Flash encryption and Secure Boot are not enabled. Both work by programming eFuses, which this project does not do, and the Arduino core bootloader is built without them. Until they are enabled, anyone with a flash dump can read the NVS secret that protects the passkey key, so the at-rest protection is weaker than with hardware-backed keys.
+
 ## FIDO2 Attestation Certificate Provisioning
 
 Polkey presents an X.509 batch attestation certificate during legacy U2F/CTAP1 registration, so relying parties can verify the credential came from genuine Polkey hardware rather than an arbitrary software authenticator. The certificate chain and its matching EC P-256 private key are stored in the ESP32's NVS (`fido_attest` namespace) — **never compiled into the firmware source**, and never committed to this repository.
@@ -309,10 +320,8 @@ For units that will actually ship, generate a real batch key/cert offline (ideal
 ### Backup, Recovery, & Others
 * [x] **Encrypted Backup Solutions:** Architect a secure, user-controlled export/import mechanism for offline backup and recovery.
 * [x] **Rethinking communication with ESP32:** Adding better communication protocols (instead of simple text).
-* [ ] **Technical Documentation:** Draft comprehensive technical documentation covering hardware schematics, firmware structure, and protocol flows.
-* [ ] **Mobile Companion Application:** Explore the feasibility of a companion mobile application for credential management.
+* [x] **Physical Security (PCB):** Design a custom Printed Circuit Board (PCB) integrating physical tamper-mesh layers and environmental sensors.
 * [ ] **Browser Extension Security:** Audit the browser extension pipeline against malicious script injections and clickjacking vectors.
-* [ ] **Physical Security (PCB):** Design a custom Printed Circuit Board (PCB) integrating physical tamper-mesh layers and environmental sensors.
 
 ---
 

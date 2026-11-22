@@ -83,6 +83,7 @@ public:
     bool isEmpty() const { return s.empty(); }
     bool equals(const String &o) const { return s == o.s; }
     bool operator==(const String &o) const { return s == o.s; }
+    bool startsWith(const String &p) const { return s.compare(0, p.s.size(), p.s) == 0; }
     bool operator==(const char *c) const { return s == (c ? c : ""); }
     bool operator!=(const String &o) const { return s != o.s; }
     bool operator!=(const char *c) const { return s != (c ? c : ""); }

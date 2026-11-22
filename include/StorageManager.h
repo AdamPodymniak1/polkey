@@ -6,6 +6,8 @@
 
 void deriveStorageKey(const String &pin);
 void clearStorageKey();
+bool upgradeVaultKdf(const String &pin);
+bool rekeyVaultForNewPin(const String &newPin);
 
 bool initStorage();
 String hashPin(const String &pin);

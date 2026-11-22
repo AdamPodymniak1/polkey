@@ -648,8 +648,7 @@ static void test_pin_and_failure_counter_records() {
     EXPECT(!isPinSet());
     EXPECT(createPin("1234"));
     EXPECT(isPinSet());
-    EXPECT(fsFile("/pin.txt").size() == 64);
-    EXPECT(std::string(fsFile("/pin.txt").begin(), fsFile("/pin.txt").end()) == hashPin("1234").s);
+    EXPECT(fsFile("/pin.txt").size() == 100);
     EXPECT(verifyPin("1234"));
     EXPECT(!fsHas("/failures.txt"));
     EXPECT(!verifyPin("0000"));
@@ -678,6 +677,271 @@ static void test_pin_and_failure_counter_records() {
     EXPECT(getForcePinChange());
     setForcePinChange(false);
     EXPECT(!getForcePinChange());
+}
+
+bool verifyFidoPinHashInternal(const uint8_t pinHash16[16]);
+
+static std::string pinFileText() { return std::string(fsFile("/pin.txt").begin(), fsFile("/pin.txt").end()); }
+static void pinPre(const char *pin, uint8_t out[16]) { fromHex(hashPin(pin), out, 16); }
+static std::string fileText(const char *p) { return std::string(fsFile(p).begin(), fsFile(p).end()); }
+static bool nvsHas(const char *k) { return host_nvs().count(k) > 0; }
+
+static void test_pin_record_is_salted_kdf() {
+    EXPECT(createPin("1234"));
+    std::string a = pinFileText();
+    EXPECT(a.size() == 100 && a.compare(0, 3, "P2$") == 0 && a[35] == '$');
+    EXPECT(a.find(hashPin("1234").s) == std::string::npos);
+    EXPECT(a.find(hashPin("1234").s.substr(0, 32)) == std::string::npos);
+    EXPECT(createPin("1234"));
+    EXPECT(pinFileText() != a);
+    EXPECT(verifyPin("1234"));
+    EXPECT(!verifyPin("1235"));
+    EXPECT(!verifyPin(""));
+    uint8_t pre[16];
+    pinPre("1234", pre);
+    EXPECT(verifyFidoPinHashInternal(pre));
+    pinPre("4321", pre);
+    EXPECT(!verifyFidoPinHashInternal(pre));
+    EXPECT(verifyFidoPinInternal("1234"));
+    EXPECT(!verifyFidoPinInternal("12345"));
+    std::string rec = pinFileText();
+    for (size_t i = 3; i < rec.size(); i++) {
+        if (i == 35) continue;
+        std::string bad = rec;
+        bad[i] = bad[i] == '0' ? '1' : '0';
+        fsFile("/pin.txt").assign(bad.begin(), bad.end());
+        pinPre("1234", pre);
+        EXPECT(!verifyFidoPinHashInternal(pre));
+    }
+    std::string trunc = rec.substr(0, 80);
+    fsFile("/pin.txt").assign(trunc.begin(), trunc.end());
+    pinPre("1234", pre);
+    EXPECT(!verifyFidoPinHashInternal(pre));
+    std::string garbage = "P2$zz";
+    fsFile("/pin.txt").assign(garbage.begin(), garbage.end());
+    EXPECT(!verifyFidoPinHashInternal(pre));
+}
+
+static void test_pin_legacy_hash_upgrades() {
+    std::string legacy = hashPin("1234").s;
+    fsFile("/pin.txt").assign(legacy.begin(), legacy.end());
+    EXPECT(!verifyPin("0000"));
+    EXPECT(pinFileText() == legacy);
+    EXPECT(verifyPin("1234"));
+    EXPECT(pinFileText().compare(0, 3, "P2$") == 0);
+    EXPECT(verifyPin("1234"));
+    EXPECT(!verifyPin("0000"));
+
+    fsFile("/pin.txt").assign(legacy.begin(), legacy.end());
+    uint8_t pre[16];
+    pinPre("0000", pre);
+    EXPECT(!verifyFidoPinHashInternal(pre));
+    EXPECT(pinFileText() == legacy);
+    pinPre("1234", pre);
+    EXPECT(verifyFidoPinHashInternal(pre));
+    EXPECT(pinFileText().compare(0, 3, "P2$") == 0);
+    EXPECT(verifyFidoPinHashInternal(pre));
+    EXPECT(verifyPin("1234"));
+
+    fsFile("/pin.txt").assign(legacy.begin(), legacy.end());
+    EXPECT(verifyFidoPinInternal("1234"));
+    EXPECT(pinFileText().compare(0, 3, "P2$") == 0);
+}
+
+static void fillVault() {
+    deriveStorageKey("1234");
+    EXPECT(savePassword("a.com", "bob", "pw-one"));
+    EXPECT(savePassword("a.com", "eve", "pw-two"));
+    EXPECT(savePassword("b.com", "bob", "pw-three"));
+    saveTotpSecret("gh", "JBSWY3DPEHPK3PXP");
+    saveTotpSecret("aws", "GEZDGNBVGY3TQOJQ");
+}
+
+static bool vaultReadable() {
+    return getPasswordFromStorage("a.com", "bob") == "pw-one" &&
+           getPasswordFromStorage("a.com", "eve") == "pw-two" &&
+           getPasswordFromStorage("b.com", "bob") == "pw-three" &&
+           getTotpSecret("gh") == "JBSWY3DPEHPK3PXP" &&
+           getTotpSecret("aws") == "GEZDGNBVGY3TQOJQ";
+}
+
+static void test_vault_salt_upgrade_rekeys_legacy_vault() {
+    fillVault();
+    EXPECT(!nvsHas("vault_salt"));
+    std::string before = fileText("/passwords.json");
+    EXPECT(upgradeVaultKdf("1234"));
+    EXPECT(nvsHas("vault_salt") && host_nvs()["vault_salt"].size() == 16);
+    EXPECT(fileText("/passwords.json") != before);
+    EXPECT(vaultReadable());
+    EXPECT(!fsHas("/passwords.tmp") && !fsHas("/totp.tmp"));
+    EXPECT(host_nvs()["vault_mig"][0] == 0);
+    clearStorageKey();
+    deriveStorageKey("1234");
+    EXPECT(vaultReadable());
+    deriveStorageKey("9999");
+    EXPECT(getPasswordFromStorage("a.com", "bob") == "");
+    deriveStorageKey("1234");
+    auto salt = host_nvs()["vault_salt"];
+    std::string afterFirst = fileText("/passwords.json");
+    EXPECT(upgradeVaultKdf("1234"));
+    EXPECT(host_nvs()["vault_salt"] == salt);
+    EXPECT(fileText("/passwords.json") == afterFirst);
+    EXPECT(vaultReadable());
+}
+
+static void test_vault_salt_set_on_empty_vault() {
+    deriveStorageKey("1234");
+    EXPECT(upgradeVaultKdf("1234"));
+    EXPECT(nvsHas("vault_salt"));
+    EXPECT(savePassword("a.com", "bob", "pw-one"));
+    clearStorageKey();
+    deriveStorageKey("1234");
+    EXPECT(getPasswordFromStorage("a.com", "bob") == "pw-one");
+}
+
+static void test_vault_salt_differs_per_device() {
+    deriveStorageKey("1234");
+    EXPECT(upgradeVaultKdf("1234"));
+    auto s1 = host_nvs()["vault_salt"];
+    host_reset_environment();
+    deriveStorageKey("1234");
+    EXPECT(upgradeVaultKdf("1234"));
+    EXPECT(host_nvs()["vault_salt"] != s1);
+}
+
+static void test_update_pin_rekeys_vault() {
+    fillVault();
+    EXPECT(upgradeVaultKdf("1234"));
+    auto salt = host_nvs()["vault_salt"];
+    EXPECT(rekeyVaultForNewPin("5678"));
+    EXPECT(host_nvs()["vault_salt"] != salt);
+    EXPECT(vaultReadable());
+    clearStorageKey();
+    deriveStorageKey("5678");
+    EXPECT(vaultReadable());
+    deriveStorageKey("1234");
+    EXPECT(getPasswordFromStorage("a.com", "bob") == "");
+    EXPECT(getTotpSecret("gh") == "");
+    clearStorageKey();
+    EXPECT(!rekeyVaultForNewPin("0000"));
+}
+
+static void test_vault_rekey_failure_leaves_vault_intact() {
+    fillVault();
+    JsonDocument doc;
+    String raw;
+    raw.s = fileText("/passwords.json");
+    deserializeJson(doc, raw);
+    doc["a.com"]["eve"] = "00:00:00";
+    String broken;
+    serializeJson(doc, broken);
+    fsFile("/passwords.json").assign(broken.s.begin(), broken.s.end());
+    std::string totpBefore = fileText("/totp.json");
+    EXPECT(!upgradeVaultKdf("1234"));
+    EXPECT(!nvsHas("vault_salt"));
+    EXPECT(!fsHas("/passwords.tmp") && !fsHas("/totp.tmp"));
+    EXPECT(fileText("/passwords.json") == broken.s);
+    EXPECT(fileText("/totp.json") == totpBefore);
+    EXPECT(getPasswordFromStorage("a.com", "bob") == "pw-one");
+    EXPECT(getTotpSecret("gh") == "JBSWY3DPEHPK3PXP");
+}
+
+static void test_vault_rekey_crash_recovery() {
+    fillVault();
+    std::string oldPw = fileText("/passwords.json"), oldTotp = fileText("/totp.json");
+    EXPECT(upgradeVaultKdf("1234"));
+    std::string newPw = fileText("/passwords.json"), newTotp = fileText("/totp.json");
+
+    fsFile("/passwords.json").assign(oldPw.begin(), oldPw.end());
+    fsFile("/totp.json").assign(oldTotp.begin(), oldTotp.end());
+    fsFile("/passwords.tmp").assign(newPw.begin(), newPw.end());
+    fsFile("/totp.tmp").assign(newTotp.begin(), newTotp.end());
+    host_nvs()["vault_mig"] = std::vector<uint8_t>(1, 1);
+    EXPECT(initStorage());
+    EXPECT(fileText("/passwords.json") == newPw && fileText("/totp.json") == newTotp);
+    EXPECT(!fsHas("/passwords.tmp") && !fsHas("/totp.tmp"));
+    EXPECT(host_nvs()["vault_mig"][0] == 0);
+    clearStorageKey();
+    deriveStorageKey("1234");
+    EXPECT(vaultReadable());
+
+    fsFile("/passwords.tmp").assign(oldPw.begin(), oldPw.end());
+    fsFile("/totp.tmp").assign(oldTotp.begin(), oldTotp.end());
+    EXPECT(initStorage());
+    EXPECT(!fsHas("/passwords.tmp") && !fsHas("/totp.tmp"));
+    EXPECT(fileText("/passwords.json") == newPw);
+    EXPECT(vaultReadable());
+}
+
+static void test_factory_reset_clears_vault_salt() {
+    deriveStorageKey("1234");
+    EXPECT(upgradeVaultKdf("1234"));
+    EXPECT(nvsHas("vault_salt"));
+    factoryResetSystem();
+    EXPECT(!nvsHas("vault_salt") && !nvsHas("vault_mig"));
+    resetFido2System();
+    EXPECT(!nvsHas("vault_salt"));
+}
+
+static void test_passkey_key_source_migration() {
+    host_set_fido_source(FIDO_KEY_SRC_LEGACY_MAC);
+    std::string priv = hexRepeat("11", 32);
+    EXPECT(savePk("aa11", "example.com", "0102", "alice", priv.c_str(), -7, 1, "", ""));
+    EXPECT(savePk("bb22", "other.com", "0304", "bob", priv.c_str(), -7, 1, "", ""));
+    EXPECT(!nvsHas("fido_ks"));
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
+    EXPECT(!getPk("aa11").ok);
+    EXPECT(initStorage());
+    EXPECT(host_nvs()["fido_ks"][0] == FIDO_KEY_SRC_NVS_SECRET);
+    EXPECT(getPk("aa11").ok && getPk("aa11").name == "alice" && getPk("aa11").priv == priv.c_str());
+    EXPECT(getPk("bb22").ok && getPk("bb22").rp == "other.com");
+    std::string snapshot = fileText("/passkeys.bin");
+    EXPECT(initStorage());
+    EXPECT(fileText("/passkeys.bin") == snapshot);
+
+    host_set_fido_source(FIDO_KEY_SRC_EFUSE_HMAC);
+    EXPECT(!getPk("aa11").ok);
+    EXPECT(initStorage());
+    EXPECT(host_nvs()["fido_ks"][0] == FIDO_KEY_SRC_EFUSE_HMAC);
+    EXPECT(getPk("aa11").ok && getPk("bb22").ok);
+    EXPECT(savePk("cc33", "new.com", "05", "carol", priv.c_str(), -7, 1, "", ""));
+    EXPECT(getPk("cc33").ok);
+
+    host_break_fido_source(FIDO_KEY_SRC_NVS_SECRET, true);
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
+    std::string pinned = fileText("/passkeys.bin");
+    EXPECT(initStorage());
+    EXPECT(fileText("/passkeys.bin") == pinned);
+    EXPECT(host_nvs()["fido_ks"][0] == FIDO_KEY_SRC_EFUSE_HMAC);
+    host_break_fido_source(FIDO_KEY_SRC_NVS_SECRET, false);
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
+}
+
+static void test_passkey_migration_edge_cases() {
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
+    EXPECT(initStorage());
+    EXPECT(host_nvs()["fido_ks"][0] == FIDO_KEY_SRC_NVS_SECRET);
+    std::string priv = hexRepeat("22", 32);
+    EXPECT(savePk("aa11", "example.com", "0102", "alice", priv.c_str(), -7, 1, "", ""));
+
+    std::string bin = fileText("/passkeys.bin");
+    fsFile("/passkeys.tmp").assign(bin.begin(), bin.end());
+    host_fs().erase("/passkeys.bin");
+    EXPECT(initStorage());
+    EXPECT(fsHas("/passkeys.bin") && !fsHas("/passkeys.tmp"));
+    EXPECT(getPk("aa11").ok);
+
+    host_nvs().erase("fido_ks");
+    host_fs().erase("/passkeys.bin");
+    host_set_fido_source(FIDO_KEY_SRC_LEGACY_MAC);
+    EXPECT(savePk("dd44", "x.com", "06", "dan", priv.c_str(), -7, 1, "", ""));
+    EXPECT(savePk("ee55", "y.com", "07", "erin", priv.c_str(), -7, 1, "", ""));
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
+    EXPECT(initStorage());
+    EXPECT(getPk("dd44").ok && getPk("ee55").ok);
+    EXPECT(host_nvs()["fido_ks"][0] == FIDO_KEY_SRC_NVS_SECRET);
+
+    host_set_fido_source(FIDO_KEY_SRC_NVS_SECRET);
 }
 
 static void test_vault_and_totp_records() {
@@ -771,7 +1035,18 @@ int main() {
     RUN(test_stateless_name_truncation_keeps_utf8_valid);
     RUN(test_stateless_rotation_invalidates_credentials);
     RUN(test_pin_and_failure_counter_records);
+    RUN(test_pin_record_is_salted_kdf);
+    RUN(test_pin_legacy_hash_upgrades);
     RUN(test_vault_and_totp_records);
+    RUN(test_vault_salt_upgrade_rekeys_legacy_vault);
+    RUN(test_vault_salt_set_on_empty_vault);
+    RUN(test_vault_salt_differs_per_device);
+    RUN(test_update_pin_rekeys_vault);
+    RUN(test_vault_rekey_failure_leaves_vault_intact);
+    RUN(test_vault_rekey_crash_recovery);
+    RUN(test_factory_reset_clears_vault_salt);
+    RUN(test_passkey_key_source_migration);
+    RUN(test_passkey_migration_edge_cases);
     RUN(test_largeblob_and_resets);
     printf("\n%d assertions passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

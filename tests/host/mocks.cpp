@@ -152,6 +152,19 @@ esp_err_t nvs_set_blob(nvs_handle_t, const char *key, const void *v, size_t len)
     g_nvs[key] = std::vector<uint8_t>((const uint8_t *)v, (const uint8_t *)v + len);
     return ESP_OK;
 }
+esp_err_t nvs_get_u8(nvs_handle_t, const char *key, uint8_t *out) {
+    auto it = g_nvs.find(key);
+    if (it == g_nvs.end() || it->second.size() != 1) return ESP_FAIL;
+    *out = it->second[0];
+    return ESP_OK;
+}
+esp_err_t nvs_set_u8(nvs_handle_t, const char *key, uint8_t val) {
+    g_nvs[key] = std::vector<uint8_t>(1, val);
+    return ESP_OK;
+}
+esp_err_t nvs_erase_key(nvs_handle_t, const char *key) {
+    return g_nvs.erase(key) ? ESP_OK : ESP_FAIL;
+}
 esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
 void nvs_close(nvs_handle_t) {}
 esp_err_t nvs_erase_all(nvs_handle_t) { g_nvs.clear(); return ESP_OK; }
@@ -246,7 +259,17 @@ String hashSHA256(const String &input) {
     EVP_Digest(input.c_str(), input.length(), out, &l, EVP_sha256(), nullptr);
     return toHex(out, 32);
 }
-void getFidoHardwareKey(byte *outKey256) { memset(outKey256, 0x42, 32); }
+static int g_fidoSource = FIDO_KEY_SRC_NVS_SECRET;
+static bool g_fidoSourceBroken[3] = {false, false, false};
+void host_set_fido_source(int s) { g_fidoSource = s; }
+void host_break_fido_source(int s, bool broken) { g_fidoSourceBroken[s] = broken; }
+int currentFidoKeySource() { return g_fidoSource; }
+bool getFidoKeyForSource(int source, byte *outKey256) {
+    if (source < 0 || source > 2 || g_fidoSourceBroken[source]) return false;
+    memset(outKey256, 0x40 + source, 32);
+    return true;
+}
+void getFidoHardwareKey(byte *outKey256) { getFidoKeyForSource(g_fidoSource, outKey256); }
 
 String encryptStoragePayload(const String &plainText, const byte *key256) {
     uint8_t iv[12];

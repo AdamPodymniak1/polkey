@@ -11,3 +11,4 @@ attestation_test/
 *.der
 provisioning*.bin
 provisioning*.csv
+tests/conformance/

@@ -226,21 +226,195 @@ static bool rpFieldMatchesRpId(const String &storedRpField, const String &plainR
     return storedRpField == hashSHA256(plainRpId);
 }
 
-void deriveStorageKey(const String &pin) {
-    const unsigned char salt[] = "VAULT_STORAGE_SALT";
+static const int KDF_ITERATIONS = 10000;
+static const char *VAULT_LEGACY_SALT = "VAULT_STORAGE_SALT";
 
+static bool nvsLoadBlob(const char *key, uint8_t *out, size_t expected) {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = expected;
+    bool ok = nvs_get_blob(h, key, out, &len) == ESP_OK && len == expected;
+    nvs_close(h);
+    return ok;
+}
+
+static bool loadVaultSalt(uint8_t salt[16]) {
+    return nvsLoadBlob("vault_salt", salt, 16);
+}
+
+static bool nvsGetU8(const char *key, uint8_t &out) {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READONLY, &h) != ESP_OK) return false;
+    bool ok = nvs_get_u8(h, key, &out) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+static bool nvsSetU8(const char *key, uint8_t value) {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return false;
+    bool ok = nvs_set_u8(h, key, value) == ESP_OK && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+static bool commitVaultSalt(const uint8_t salt[16]) {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return false;
+    bool ok = nvs_set_blob(h, "vault_salt", salt, 16) == ESP_OK &&
+              nvs_set_u8(h, "vault_mig", 1) == ESP_OK &&
+              nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+static void clearVaultSalt() {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_erase_key(h, "vault_salt");
+    nvs_erase_key(h, "vault_mig");
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void deriveKeyWithSalt(const String &pin, const uint8_t *salt, size_t saltLen, byte *out) {
     mbedtls_pkcs5_pbkdf2_hmac_ext(
         MBEDTLS_MD_SHA256,
         (const unsigned char *)pin.c_str(),
         pin.length(),
         salt,
-        sizeof(salt) - 1,
-        10000,
+        saltLen,
+        KDF_ITERATIONS,
         32,
-        storageKey
+        out
     );
+}
 
+void deriveStorageKey(const String &pin) {
+    uint8_t salt[16];
+    if (loadVaultSalt(salt)) {
+        deriveKeyWithSalt(pin, salt, 16, storageKey);
+    } else {
+        deriveKeyWithSalt(pin, (const uint8_t *)VAULT_LEGACY_SALT, strlen(VAULT_LEGACY_SALT), storageKey);
+    }
     isStorageKeyLoaded = true;
+}
+
+static bool rekeyJsonFile(const char *path, const char *tmpPath, const byte *oldKey, const byte *newKey, int depth) {
+    if (!SPIFFS.exists(path)) return true;
+    File in = SPIFFS.open(path, "r");
+    if (!in) return false;
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, in);
+    in.close();
+    if (err != DeserializationError::Ok) return false;
+
+    bool ok = true;
+    auto rekeyValue = [&](JsonVariant v) {
+        String enc = v.as<String>();
+        String plain = decryptStoragePayload(enc, oldKey);
+        if (plain.length() == 0) { ok = false; return; }
+        String fresh = encryptStoragePayload(plain, newKey);
+        secureWipe(plain);
+        if (fresh.length() == 0) { ok = false; return; }
+        v.set(fresh);
+    };
+    for (JsonPair outer : doc.as<JsonObject>()) {
+        if (depth == 2) {
+            for (JsonPair inner : outer.value().as<JsonObject>()) {
+                rekeyValue(inner.value());
+                if (!ok) return false;
+            }
+        } else {
+            rekeyValue(outer.value());
+            if (!ok) return false;
+        }
+    }
+
+    File out = SPIFFS.open(tmpPath, "w");
+    if (!out) return false;
+    size_t expected = measureJson(doc);
+    size_t written = serializeJson(doc, out);
+    out.close();
+    if (written != expected) {
+        SPIFFS.remove(tmpPath);
+        return false;
+    }
+    return true;
+}
+
+static void finalizeVaultRekeyLocked() {
+    if (SPIFFS.exists("/passwords.tmp")) {
+        SPIFFS.remove("/passwords.json");
+        SPIFFS.rename("/passwords.tmp", "/passwords.json");
+    }
+    if (SPIFFS.exists("/totp.tmp")) {
+        SPIFFS.remove("/totp.json");
+        SPIFFS.rename("/totp.tmp", "/totp.json");
+    }
+}
+
+static bool rekeyVault(const byte *oldKey, const byte *newKey, const uint8_t newSalt[16]) {
+    xSemaphoreTake(storageMutex, portMAX_DELAY);
+    SPIFFS.remove("/passwords.tmp");
+    SPIFFS.remove("/totp.tmp");
+    bool ok = rekeyJsonFile("/passwords.json", "/passwords.tmp", oldKey, newKey, 2) &&
+              rekeyJsonFile("/totp.json", "/totp.tmp", oldKey, newKey, 1);
+    if (ok) ok = commitVaultSalt(newSalt);
+    if (!ok) {
+        SPIFFS.remove("/passwords.tmp");
+        SPIFFS.remove("/totp.tmp");
+        xSemaphoreGive(storageMutex);
+        return false;
+    }
+    finalizeVaultRekeyLocked();
+    nvsSetU8("vault_mig", 0);
+    xSemaphoreGive(storageMutex);
+    return true;
+}
+
+static void recoverVaultRekeyLocked() {
+    uint8_t mig = 0;
+    nvsGetU8("vault_mig", mig);
+    if (mig == 1) {
+        finalizeVaultRekeyLocked();
+        nvsSetU8("vault_mig", 0);
+    } else {
+        SPIFFS.remove("/passwords.tmp");
+        SPIFFS.remove("/totp.tmp");
+    }
+}
+
+bool upgradeVaultKdf(const String &pin) {
+    if (!isStorageKeyLoaded) return false;
+    uint8_t existing[16];
+    if (loadVaultSalt(existing)) return true;
+    uint8_t salt[16];
+    esp_fill_random(salt, 16);
+    byte newKey[32];
+    deriveKeyWithSalt(pin, salt, 16, newKey);
+    if (!rekeyVault(storageKey, newKey, salt)) {
+        secureZero(newKey, 32);
+        return false;
+    }
+    memcpy(storageKey, newKey, 32);
+    secureZero(newKey, 32);
+    return true;
+}
+
+bool rekeyVaultForNewPin(const String &newPin) {
+    if (!isStorageKeyLoaded) return false;
+    uint8_t salt[16];
+    esp_fill_random(salt, 16);
+    byte newKey[32];
+    deriveKeyWithSalt(newPin, salt, 16, newKey);
+    if (!rekeyVault(storageKey, newKey, salt)) {
+        secureZero(newKey, 32);
+        return false;
+    }
+    memcpy(storageKey, newKey, 32);
+    secureZero(newKey, 32);
+    return true;
 }
 
 void clearStorageKey() {
@@ -248,9 +422,63 @@ void clearStorageKey() {
     isStorageKeyLoaded = false;
 }
 
+static void migratePasskeyKeyLocked() {
+    int cur = currentFidoKeySource();
+    uint8_t stored = 255;
+    bool haveStored = nvsGetU8("fido_ks", stored);
+    bool hasFile = SPIFFS.exists("/passkeys.bin");
+    if (!hasFile) {
+        if (!haveStored || stored != cur) nvsSetU8("fido_ks", (uint8_t)cur);
+        return;
+    }
+    int prev = haveStored ? (int)stored : FIDO_KEY_SRC_LEGACY_MAC;
+    if (prev == cur) return;
+
+    byte prevKey[32], curKey[32];
+    if (!getFidoKeyForSource(prev, prevKey) || !getFidoKeyForSource(cur, curKey)) return;
+
+    File file = SPIFFS.open("/passkeys.bin", "r");
+    if (!file) return;
+    std::vector<uint8_t> out;
+    bool ok = true;
+    while (file.available()) {
+        PasskeyFrame f;
+        if (!readPasskeyFrame(file, f)) { ok = false; break; }
+        String pay;
+        if (!readPayloadString(file, f.payLen, pay)) { ok = false; break; }
+        if (f.status != 1) continue;
+        String plain = decryptStoragePayload(pay, curKey);
+        if (plain.length() > 0) {
+            secureWipe(plain);
+            appendPasskeyFrame(out, 1, f.algId, f.cid, f.rp, pay);
+            continue;
+        }
+        plain = decryptStoragePayload(pay, prevKey);
+        if (plain.length() == 0) {
+            appendPasskeyFrame(out, 1, f.algId, f.cid, f.rp, pay);
+            continue;
+        }
+        String fresh = encryptStoragePayload(plain, curKey);
+        secureWipe(plain);
+        if (fresh.length() == 0 || fresh.length() > 0xFFFF) { ok = false; break; }
+        appendPasskeyFrame(out, 1, f.algId, f.cid, f.rp, fresh);
+    }
+    file.close();
+    secureZero(prevKey, 32);
+    secureZero(curKey, 32);
+    if (ok && replacePasskeyFile(out)) nvsSetU8("fido_ks", (uint8_t)cur);
+}
+
 bool initStorage() {
     xSemaphoreTake(storageMutex, portMAX_DELAY);
     bool res = SPIFFS.begin(true);
+    if (res) {
+        if (!SPIFFS.exists("/passkeys.bin") && SPIFFS.exists("/passkeys.tmp")) {
+            SPIFFS.rename("/passkeys.tmp", "/passkeys.bin");
+        }
+        recoverVaultRekeyLocked();
+        migratePasskeyKeyLocked();
+    }
     xSemaphoreGive(storageMutex);
     return res;
 }
@@ -267,6 +495,74 @@ String hashPin(const String &pin) {
     return toHex(shaResult, 32);
 }
 
+static void pinPrehash(const String &pin, uint8_t out16[16]) {
+    byte sha[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const unsigned char *)pin.c_str(), pin.length());
+    mbedtls_md_finish(&ctx, sha);
+    mbedtls_md_free(&ctx);
+    memcpy(out16, sha, 16);
+    secureZero(sha, 32);
+}
+
+static String makePinRecord(const uint8_t pre16[16]) {
+    uint8_t salt[16];
+    esp_fill_random(salt, 16);
+    uint8_t h[32];
+    mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, pre16, 16, salt, 16, KDF_ITERATIONS, 32, h);
+    String rec = "P2$" + toHex(salt, 16) + "$" + toHex(h, 32);
+    secureZero(h, 32);
+    return rec;
+}
+
+enum PinMatch { PIN_NO = 0, PIN_OK_LEGACY = 1, PIN_OK = 2 };
+
+static PinMatch matchPinRecord(const String &stored, const uint8_t pre16[16], const String *legacyFullHashHex) {
+    if (stored.startsWith("P2$") && stored.length() == 3 + 32 + 1 + 64 && stored[35] == '$') {
+        uint8_t salt[16], expected[32], h[32];
+        if (!hexDecodeStrict(stored.substring(3, 35), salt, 16)) return PIN_NO;
+        if (!hexDecodeStrict(stored.substring(36), expected, 32)) return PIN_NO;
+        mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, pre16, 16, salt, 16, KDF_ITERATIONS, 32, h);
+        bool ok = constantTimeEqual(h, expected, 32);
+        secureZero(h, 32);
+        return ok ? PIN_OK : PIN_NO;
+    }
+    if (stored.length() < 32) return PIN_NO;
+    if (legacyFullHashHex) {
+        if (stored.length() != legacyFullHashHex->length()) return PIN_NO;
+        return constantTimeEqual((const uint8_t *)stored.c_str(), (const uint8_t *)legacyFullHashHex->c_str(), stored.length()) ? PIN_OK_LEGACY : PIN_NO;
+    }
+    uint8_t storedPre[16];
+    if (!hexDecodeStrict(stored.substring(0, 32), storedPre, 16)) return PIN_NO;
+    return constantTimeEqual(storedPre, pre16, 16) ? PIN_OK_LEGACY : PIN_NO;
+}
+
+static String readPinFile() {
+    xSemaphoreTake(storageMutex, portMAX_DELAY);
+    String stored = "";
+    File file = SPIFFS.open("/pin.txt", "r");
+    if (file) {
+        stored = file.readString();
+        file.close();
+    }
+    xSemaphoreGive(storageMutex);
+    return stored;
+}
+
+static void upgradePinRecord(const uint8_t pre16[16]) {
+    String rec = makePinRecord(pre16);
+    xSemaphoreTake(storageMutex, portMAX_DELAY);
+    File file = SPIFFS.open("/pin.txt", "w");
+    if (file) {
+        file.print(rec);
+        file.close();
+    }
+    xSemaphoreGive(storageMutex);
+}
+
 bool isPinSet() {
     xSemaphoreTake(storageMutex, portMAX_DELAY);
     bool res = SPIFFS.exists("/pin.txt");
@@ -278,7 +574,10 @@ bool createPin(const String &pin) {
     if (pin.length() < getMinPinLength()) {
         return false;
     }
-    String hashedPin = hashPin(pin);
+    uint8_t pre[16];
+    pinPrehash(pin, pre);
+    String hashedPin = makePinRecord(pre);
+    secureZero(pre, 16);
     xSemaphoreTake(storageMutex, portMAX_DELAY);
     File file = SPIFFS.open("/pin.txt", "w");
     if (file) {
@@ -332,6 +631,8 @@ void factoryResetSystem() {
     SPIFFS.remove("/passkeys.bin");
     SPIFFS.remove("/passkeys.tmp");
     SPIFFS.remove("/totp.json");
+    SPIFFS.remove("/passwords.tmp");
+    SPIFFS.remove("/totp.tmp");
     SPIFFS.remove("/pin.txt");
     SPIFFS.remove("/failures.txt");
     SPIFFS.remove("/crypto_alg.txt");
@@ -342,6 +643,7 @@ void factoryResetSystem() {
     SPIFFS.remove("/bio_templates.json");
     xSemaphoreGive(storageMutex);
 
+    clearVaultSalt();
     deleteAllFingerprints();
 }
 
@@ -398,17 +700,17 @@ bool deletePin() {
 }
 
 bool verifyPin(const String &pin) {
-    xSemaphoreTake(storageMutex, portMAX_DELAY);
-    File file = SPIFFS.open("/pin.txt", "r");
-    if (!file) {
-        xSemaphoreGive(storageMutex);
-        return false;
-    }
-    String storedHash = file.readString();
-    file.close();
-    xSemaphoreGive(storageMutex);
+    String storedHash = readPinFile();
+    if (storedHash.length() == 0) return false;
 
-    if (storedHash == hashPin(pin)) {
+    uint8_t pre[16];
+    pinPrehash(pin, pre);
+    String legacyFull = hashPin(pin);
+    PinMatch m = matchPinRecord(storedHash, pre, &legacyFull);
+    if (m == PIN_OK_LEGACY) upgradePinRecord(pre);
+    secureZero(pre, 16);
+
+    if (m != PIN_NO) {
         resetFailedPinAttempts();
         return true;
     } else {
@@ -1377,6 +1679,8 @@ void resetFido2System() {
     SPIFFS.remove("/passkeys.bin");
     SPIFFS.remove("/passkeys.tmp");
     SPIFFS.remove("/totp.json");
+    SPIFFS.remove("/passwords.tmp");
+    SPIFFS.remove("/totp.tmp");
     SPIFFS.remove("/pin.txt");
     SPIFFS.remove("/failures.txt");
     SPIFFS.remove("/crypto_alg.txt");
@@ -1392,6 +1696,7 @@ void resetFido2System() {
     authenticated = false;
     currentCommandState = STATE_READY;
     
+    clearVaultSalt();
     deleteAllFingerprints();
     
     CommsManager::sendEvent("FIDO2", "RESET_COMPLETE");
@@ -1886,30 +2191,20 @@ void resetFailedFidoPinAttempts() {
 
 bool verifyFidoPinInternal(const String& pin) {
     if (!isPinSet()) return false;
-    String hashedPin = hashPin(pin);
-    xSemaphoreTake(storageMutex, portMAX_DELAY);
-    File file = SPIFFS.open("/pin.txt", "r");
-    String storedHash = "";
-    if (file) {
-        storedHash = file.readString();
-        file.close();
-    }
-    xSemaphoreGive(storageMutex);
-    return storedHash == hashedPin;
+    String stored = readPinFile();
+    uint8_t pre[16];
+    pinPrehash(pin, pre);
+    String legacyFull = hashPin(pin);
+    PinMatch m = matchPinRecord(stored, pre, &legacyFull);
+    if (m == PIN_OK_LEGACY) upgradePinRecord(pre);
+    secureZero(pre, 16);
+    return m != PIN_NO;
 }
 
 bool verifyFidoPinHashInternal(const uint8_t pinHash16[16]) {
     if (!isPinSet()) return false;
-    xSemaphoreTake(storageMutex, portMAX_DELAY);
-    File file = SPIFFS.open("/pin.txt", "r");
-    String storedHash = "";
-    if (file) {
-        storedHash = file.readString();
-        file.close();
-    }
-    xSemaphoreGive(storageMutex);
-    if (storedHash.length() < 32) return false;
-    uint8_t storedBytes[16];
-    fromHex(storedHash.substring(0, 32), storedBytes, 16);
-    return memcmp(storedBytes, pinHash16, 16) == 0;
+    String stored = readPinFile();
+    PinMatch m = matchPinRecord(stored, pinHash16, nullptr);
+    if (m == PIN_OK_LEGACY) upgradePinRecord(pinHash16);
+    return m != PIN_NO;
 }
