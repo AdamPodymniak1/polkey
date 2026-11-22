@@ -48,7 +48,12 @@ bool generateAlgSignature(int algId, const String &privateKeyHex, const uint8_t 
 int decodeBase32(const char* b32, uint8_t* out);
 String generateTOTP(const String& base32Secret, uint32_t unixTime);
 
+enum { FIDO_KEY_SRC_LEGACY_MAC = 0, FIDO_KEY_SRC_NVS_SECRET = 1, FIDO_KEY_SRC_EFUSE_HMAC = 2 };
 void getFidoHardwareKey(byte *outKey256);
+bool getFidoKeyForSource(int source, byte *outKey256);
+int currentFidoKeySource();
+bool fidoEfuseKeyAvailable();
+void getFidoSecurityStatus(bool &flashEncryption, bool &secureBoot, bool &efuseHmacKey);
 
 void init_aes_nonce_subsystem();
 void generate_aes_gcm_nonce(byte *nonce_out);

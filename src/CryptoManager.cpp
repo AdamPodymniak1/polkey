@@ -16,6 +16,10 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <esp_mac.h>
+#include <esp_efuse.h>
+#include <esp_hmac.h>
+#include <esp_flash_encrypt.h>
+#include <esp_secure_boot.h>
 
 #define PBKDF2_ITERATIONS 10000
 #define HASH_SIZE 32
@@ -772,21 +776,85 @@ String generateTOTP(const String& base32Secret, uint32_t unixTime) {
     return String(code);
 }
 
-void getFidoHardwareKey(byte* outKey256) {
-    uint8_t mac[6];
+static const char FIDO_KEY_DOMAIN[] = "FIDO_PASSKEY_KEY_V2";
 
-    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
-        memset(mac, 0xAA, 6);
+static bool efuseHmacKeyId(hmac_key_id_t &id) {
+    esp_efuse_block_t block;
+    if (!esp_efuse_find_purpose(ESP_EFUSE_KEY_PURPOSE_HMAC_UP, &block)) return false;
+    if (block < EFUSE_BLK_KEY0 || block > EFUSE_BLK_KEY5) return false;
+    id = (hmac_key_id_t)(block - EFUSE_BLK_KEY0);
+    return true;
+}
+
+bool fidoEfuseKeyAvailable() {
+    hmac_key_id_t id;
+    return efuseHmacKeyId(id);
+}
+
+int currentFidoKeySource() {
+    return fidoEfuseKeyAvailable() ? FIDO_KEY_SRC_EFUSE_HMAC : FIDO_KEY_SRC_NVS_SECRET;
+}
+
+static bool loadOrCreateDeviceSecret(uint8_t secret[32]) {
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) return false;
+    size_t len = 32;
+    bool ok = nvs_get_blob(h, "fido_dk", secret, &len) == ESP_OK && len == 32;
+    if (!ok) {
+        esp_fill_random(secret, 32);
+        ok = nvs_set_blob(h, "fido_dk", secret, 32) == ESP_OK && nvs_commit(h) == ESP_OK;
     }
+    nvs_close(h);
+    return ok;
+}
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&ctx);
-    mbedtls_md_update(&ctx, mac, 6);
-    mbedtls_md_update(&ctx, (const unsigned char*)"VAULT_APP_FIDO2_ISOLATION_SECRET", 32);
-    mbedtls_md_finish(&ctx, outKey256);
-    mbedtls_md_free(&ctx);
+bool getFidoKeyForSource(int source, byte *outKey256) {
+    if (source == FIDO_KEY_SRC_LEGACY_MAC) {
+        uint8_t mac[6];
+        if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+            memset(mac, 0xAA, 6);
+        }
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+        mbedtls_md_starts(&ctx);
+        mbedtls_md_update(&ctx, mac, 6);
+        mbedtls_md_update(&ctx, (const unsigned char*)"VAULT_APP_FIDO2_ISOLATION_SECRET", 32);
+        mbedtls_md_finish(&ctx, outKey256);
+        mbedtls_md_free(&ctx);
+        return true;
+    }
+    if (source == FIDO_KEY_SRC_NVS_SECRET) {
+        uint8_t secret[32];
+        if (!loadOrCreateDeviceSecret(secret)) return false;
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+        mbedtls_md_hmac_starts(&ctx, secret, 32);
+        mbedtls_md_hmac_update(&ctx, (const unsigned char*)FIDO_KEY_DOMAIN, sizeof(FIDO_KEY_DOMAIN) - 1);
+        mbedtls_md_hmac_finish(&ctx, outKey256);
+        mbedtls_md_free(&ctx);
+        memset(secret, 0, sizeof(secret));
+        return true;
+    }
+    if (source == FIDO_KEY_SRC_EFUSE_HMAC) {
+        hmac_key_id_t id;
+        if (!efuseHmacKeyId(id)) return false;
+        return esp_hmac_calculate(id, FIDO_KEY_DOMAIN, sizeof(FIDO_KEY_DOMAIN) - 1, outKey256) == ESP_OK;
+    }
+    return false;
+}
+
+void getFidoHardwareKey(byte* outKey256) {
+    if (!getFidoKeyForSource(currentFidoKeySource(), outKey256)) {
+        esp_fill_random(outKey256, 32);
+    }
+}
+
+void getFidoSecurityStatus(bool &flashEncryption, bool &secureBoot, bool &efuseHmacKey) {
+    flashEncryption = esp_flash_encryption_enabled();
+    secureBoot = esp_secure_boot_enabled();
+    efuseHmacKey = fidoEfuseKeyAvailable();
 }
 
 extern "C" {

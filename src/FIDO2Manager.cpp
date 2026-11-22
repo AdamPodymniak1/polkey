@@ -1091,7 +1091,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
         if (!biometricVerified) {
             showDisplayMessage(1, "VERIFICATION FAILED", "", 0);
-            uint8_t err = 0x34;
+            uint8_t err = 0x2F;
             sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
             free(responseBuffer);
             return;
@@ -1739,7 +1739,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 }
             }
             if (!biometricVerified) {
-                uint8_t err = 0x34;
+                uint8_t err = 0x2F;
                 sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                 free(responseBuffer);
                 return;
@@ -2151,10 +2151,38 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
+            if (getFailedFidoPinAttempts() >= 10) {
+                uint8_t err = 0x32;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
+            if (!sessionKeyValid || keyAgreementLen != 64 || pinHashEncLen != 16 ||
+                !fidoEcdhSharedSecret(sessionPrivateKey, keyAgreement, sessionSharedSecret)) {
+                uint8_t err = 0x30;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
+            uint8_t suppliedPinHash[16];
+            if (!aesCbcZeroIvDecrypt(sessionSharedSecret, pinHashEnc, 16, suppliedPinHash) ||
+                !verifyFidoPinHashInternal(suppliedPinHash)) {
+                memset(suppliedPinHash, 0, sizeof(suppliedPinHash));
+                incrementFailedFidoPinAttempts();
+                sessionKeyValid = false;
+                uint8_t err = 0x31;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
+            memset(suppliedPinHash, 0, sizeof(suppliedPinHash));
+            resetFailedFidoPinAttempts();
+
             encoder.writeMapHeader(1);
             encoder.writeUnsignedInt(0x02);
             uint8_t mockToken[32] = {0};
             esp_fill_random(mockToken, 32);
+            memcpy(activeAuthToken, mockToken, 32);
             encoder.writeByteString(mockToken, 32);
         }
         else if (subCommand == 0x09) {
@@ -2176,6 +2204,26 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
+            if (!sessionKeyValid || keyAgreementLen != 64 || pinHashEncLen != 16 ||
+                !fidoEcdhSharedSecret(sessionPrivateKey, keyAgreement, sessionSharedSecret)) {
+                uint8_t err = 0x30;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
+            uint8_t suppliedPinHash[16];
+            if (!aesCbcZeroIvDecrypt(sessionSharedSecret, pinHashEnc, 16, suppliedPinHash) ||
+                !verifyFidoPinHashInternal(suppliedPinHash)) {
+                memset(suppliedPinHash, 0, sizeof(suppliedPinHash));
+                incrementFailedFidoPinAttempts();
+                sessionKeyValid = false;
+                uint8_t err = 0x31;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
+            memset(suppliedPinHash, 0, sizeof(suppliedPinHash));
+            resetFailedFidoPinAttempts();
 
             encoder.writeMapHeader(1);
             encoder.writeUnsignedInt(0x02);
@@ -2571,7 +2619,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 showDisplayMessage(1, "VERIFY TO WRITE", "BLOB", 0);
                 if (!fidoVerifyFingerprint()) {
                     showDisplayMessage(1, "VERIFICATION FAILED", "", 1500);
-                    uint8_t err = 0x34;
+                    uint8_t err = 0x2F;
                     sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                     free(responseBuffer);
                     return;
@@ -2886,7 +2934,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 }
 
                 if (!biometricVerified) {
-                    uint8_t err = 0x34;
+                    uint8_t err = 0x2F;
                     sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                     free(responseBuffer);
                     return;
