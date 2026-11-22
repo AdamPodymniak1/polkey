@@ -110,6 +110,9 @@ void setFingerprintLed(bool on) {
 }
 
 void initFingerprintSensor() {
+#ifdef FIDO_TEST_AUTO_UP
+    Serial.println("[SYS:WARN] TEST BUILD: user presence and verification are bypassed");
+#endif
 #if AUTH_BUTTON_ONLY
     pinMode(AUTH_BUTTON_PIN, INPUT_PULLUP);
     CommsManager::sendEvent("SYS", "BUTTON_READY");

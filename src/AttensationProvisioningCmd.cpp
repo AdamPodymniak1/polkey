@@ -10,6 +10,7 @@ bool eraseAttestationProvisioning();
 bool saveAttestationPrivateKey(const uint8_t privKey[32]);
 bool saveAttestationCertChain(const uint8_t* buf, size_t len);
 bool isAttestationProvisioned();
+void reloadFidoAttestation();
 
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
     #define ATTPROV_GRP MBEDTLS_PRIVATE(grp)
@@ -187,6 +188,7 @@ bool provisionAttestationFromHex(const String &privHex, const String &certHex, S
     free(chainBlob);
 
     if (keyOk && chainOk && isAttestationProvisioned()) {
+        reloadFidoAttestation();
         return true;
     }
     errorOut = "NVS_WRITE";

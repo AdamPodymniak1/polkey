@@ -21,6 +21,12 @@ test_cbor_strict: test_cbor_strict.cpp ../../src/CborEngine.cpp
 strict: test_cbor_strict
 	$(ASAN_ENV) ./test_cbor_strict
 
+test_ctap_validate: test_ctap_validate.cpp ../../src/CtapValidate.cpp ../../src/CborEngine.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+validate: test_ctap_validate
+	$(ASAN_ENV) ./test_ctap_validate
+
 STORAGE_SRC = test_storage.cpp mocks.cpp ../../src/Globals.cpp
 STORAGE_FLAGS = -DARDUINO=10800 -I$(JSON)
 

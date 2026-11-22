@@ -11,7 +11,9 @@ openssl req -new -x509 \
   -key "$OUT_DIR/attest_key.pem" \
   -out "$OUT_DIR/attest_cert.pem" \
   -days "$DAYS" \
-  -subj "/O=Vault Bench Test/CN=Vault Bench Test FIDO2 Attestation"
+  -subj "/C=PL/O=Vault Bench Test/OU=Authenticator Attestation/CN=Vault Bench Test FIDO2 Attestation" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature"
 
 openssl x509 -in "$OUT_DIR/attest_cert.pem" -outform DER -out "$OUT_DIR/attest_cert.der"
 

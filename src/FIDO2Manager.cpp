@@ -6,6 +6,8 @@
 #include "StorageManager.h"
 #include <vector>
 #include "esp_heap_caps.h"
+#include "CtapValidate.h"
+#include <algorithm>
 #include "esp_mac.h"
 
 #define DEBUG_UART_BAUD  115200
@@ -43,11 +45,11 @@ static size_t nextAssertionIdx = 0;
 static uint8_t nextAssertionClientHash[32] = {0};
 static String nextAssertionRpId = "";
 static bool nextAssertionOptionUV = false;
+static bool nextAssertionFullUser = false;
 static bool nextAssertionExtReq = false;
-static uint8_t nextAssertionSalt1[32] = {0};
-static uint8_t nextAssertionSalt2[32] = {0};
-static size_t nextAssertionSalt1Len = 0;
-static size_t nextAssertionSalt2Len = 0;
+static uint8_t nextAssertionShared[32] = {0};
+static uint8_t nextAssertionSalts[64] = {0};
+static size_t nextAssertionSaltsLen = 0;
 static bool nextAssertionLargeBlobReq = false;
 static bool nextAssertionCredBlobReq = false;
 
@@ -86,6 +88,7 @@ bool saveBioTemplateName(uint8_t templateId, const String &friendlyName);
 String getBioTemplateName(uint8_t templateId);
 bool deleteBioTemplateRecord(uint8_t templateId);
 
+static unsigned long fidoPowerUpMillis = 0;
 static bool activeAuthTokenValid = false;
 static uint8_t activeAuthTokenPerms = 0;
 
@@ -118,6 +121,11 @@ void initFidoAttestation() {
     }
 
     attestationReady = true;
+}
+
+void reloadFidoAttestation() {
+    attestationReady = false;
+    initFidoAttestation();
 }
 
 bool isBatchAttestationAvailable() {
@@ -201,6 +209,9 @@ void savePersistedSignCount(uint32_t count) {
 static const int MAX_FAILED_UV_ATTEMPTS = 8;
 
 bool fidoVerifyFingerprint() {
+#ifdef FIDO_TEST_AUTO_UP
+    return true;
+#endif
 #if !AUTH_BUTTON_ONLY
     if (getFailedUvAttempts() >= MAX_FAILED_UV_ATTEMPTS) {
         fidoLogf("UV", "BLOCKED: failedUvAttempts=%d >= %d", getFailedUvAttempts(), MAX_FAILED_UV_ATTEMPTS);
@@ -637,7 +648,7 @@ void FIDO2HIDDevice::processCtapCommand(uint32_t channel, uint8_t cmd, uint8_t* 
         resp[13] = 0x01;
         resp[14] = 0x01;
         resp[15] = 0x00;
-        resp[16] = 0x04;
+        resp[16] = 0x05;
 
         sendCtapResponse(channel, CTAPHID_INIT, resp, 17);
     }
@@ -654,6 +665,11 @@ void FIDO2HIDDevice::processCtapCommand(uint32_t channel, uint8_t cmd, uint8_t* 
         processU2fCommand(channel, data, len);
     }
     else if (cmd == CTAPHID_CBOR && isChannelAllocated(channel)) {
+        if (len == 0) {
+            uint8_t err = 0x03;
+            sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
+            return;
+        }
         processCborCommand(channel, data, len);
     }
     else {
@@ -696,6 +712,71 @@ static bool parseCoseKeyPubXY(CborParser &parser, uint8_t xyOut[64]) {
         }
     }
     return gotX && gotY;
+}
+
+static uint8_t hmacSecretPrepare(bool kaPresent, const uint8_t *keyAgreement, size_t kaLen,
+                                 bool saltEncPresent, const uint8_t *saltEnc, size_t saltEncLen,
+                                 bool saltAuthPresent, const uint8_t *saltAuth, size_t saltAuthLen,
+                                 uint64_t protocol, uint8_t shared[32], uint8_t salts[64], size_t &saltsLen) {
+    saltsLen = 0;
+    if (!kaPresent || !saltEncPresent || !saltAuthPresent) return 0x14;
+    if (kaLen != 64) return 0x12;
+    if (saltEncLen != 32 && saltEncLen != 64) return 0x03;
+    if (saltAuthLen != 16) return 0x03;
+    if (protocol != 1) return 0x33;
+    if (!sessionKeyValid || !fidoEcdhSharedSecret(sessionPrivateKey, keyAgreement, shared)) return 0xE0;
+    uint8_t expected[32];
+    hmacSha256Raw(shared, saltEnc, saltEncLen, expected);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 16; i++) diff |= expected[i] ^ saltAuth[i];
+    if (diff != 0) return 0xE0;
+    if (!aesCbcZeroIvDecrypt(shared, saltEnc, saltEncLen, salts)) return 0xE0;
+    saltsLen = saltEncLen;
+    return 0;
+}
+
+static bool hmacSecretCompute(const uint8_t shared[32], const uint8_t *salts, size_t saltsLen,
+                              const String &privateKeyHex, bool uvPerformed, uint8_t *encOut, size_t &outLen) {
+    uint8_t keyHash[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const unsigned char*)privateKeyHex.c_str(), privateKeyHex.length());
+    mbedtls_md_finish(&ctx, keyHash);
+    mbedtls_md_free(&ctx);
+
+    uint8_t credRandom[32];
+    const char *label = uvPerformed ? "CredRandomWithUV" : "CredRandomWithoutUV";
+    hmacSha256Raw(keyHash, (const uint8_t*)label, strlen(label), credRandom);
+    memset(keyHash, 0, sizeof(keyHash));
+
+    uint8_t plain[64];
+    for (size_t off = 0; off < saltsLen; off += 32) {
+        hmacSha256Raw(credRandom, salts + off, 32, plain + off);
+    }
+    memset(credRandom, 0, sizeof(credRandom));
+    bool ok = aesCbcZeroIvEncrypt(shared, plain, saltsLen, encOut);
+    memset(plain, 0, sizeof(plain));
+    outLen = ok ? saltsLen : 0;
+    return ok;
+}
+
+static size_t buildAssertionExtensions(uint8_t *out, size_t cap, const uint8_t *hmacEnc, size_t hmacLen,
+                                       const uint8_t *blob, size_t blobLen, bool hasBlob) {
+    size_t count = (hmacLen > 0 ? 1 : 0) + (hasBlob ? 1 : 0);
+    if (count == 0) return 0;
+    CborEncoder enc(out, cap);
+    enc.writeMapHeader(count);
+    if (hasBlob) {
+        enc.writeTextString("credBlob");
+        enc.writeByteString(blob, blobLen);
+    }
+    if (hmacLen > 0) {
+        enc.writeTextString("hmac-secret");
+        enc.writeByteString(hmacEnc, hmacLen);
+    }
+    return enc.getOffset();
 }
 
 void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_t len) {
@@ -858,6 +939,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         bool hmacSecretRequested = false;
         int selectedAlgId = defaultCryptoAlg;
         int requestedCredProtect = 1;
+        bool credProtectRequested = false;
         bool largeBlobKeyRequested = false;
         bool credBlobRequested = false;
         uint8_t credBlobRaw[MAX_CRED_BLOB_LEN] = {0};
@@ -871,6 +953,14 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         uint8_t excludeCredentialIds[MAX_EXCLUDE_CREDENTIALS][MAX_CREDENTIAL_ID_LEN];
         size_t excludeCredentialIdLens[MAX_EXCLUDE_CREDENTIALS] = {0};
         size_t excludeCredentialCount = 0;
+
+        uint8_t mcValidation = ctapValidateMakeCredential(data + 1, len - 1);
+        if (mcValidation != 0) {
+            fidoLogf("MC", "request rejected by validation: 0x%02X", mcValidation);
+            sendCtapResponse(channel, CTAPHID_CBOR, &mcValidation, 1);
+            free(responseBuffer);
+            return;
+        }
 
         CborParser parser(data + 1, len - 1);
         uint8_t rootType;
@@ -977,6 +1067,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                                     if (parser.readTypeAndValue(valType, valVal) && valType == 0 &&
                                         valVal >= 1 && valVal <= 3) {
                                         requestedCredProtect = (int)valVal;
+                                        credProtectRequested = true;
                                     } else { parser.skipValue(); }
                                 }
 
@@ -1081,7 +1172,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         bool pinVerified = false;
         if (mcPinParamPresent) {
             uint8_t err = 0;
-            if (mcPinUvAuthParamLen == 0) err = isFidoPinSet() ? 0x36 : 0x35;
+            if (mcPinUvAuthParamLen == 0) err = isFidoPinSet() ? 0x33 : 0x35;
             else if (!isFidoPinSet()) err = 0x35;
             else if (mcPinProtocol != 1) err = 0x33;
             else if (!verifyPinUvAuthParam(clientDataHash, mcPinUvAuthParam, mcPinUvAuthParamLen, 0x01)) err = 0x33;
@@ -1091,7 +1182,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 return;
             }
             pinVerified = true;
-        } else if (AUTH_BUTTON_ONLY && isFidoPinSet()) {
+        } else if (isFidoPinSet() && !mcOptionUV) {
             uint8_t err = 0x36;
             sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
             free(responseBuffer);
@@ -1101,9 +1192,11 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         if (excludeCredentialCount > 0) {
             for (size_t i = 0; i < excludeCredentialCount; i++) {
                 String candidateIdHex = toHex(excludeCredentialIds[i], excludeCredentialIdLens[i]);
-                String dummyRpId, dummyUserId, dummyUser, dummyKey;
+                String dummyRpId, dummyUserId, dummyUser, dummyKey, dummyLargeBlob;
                 int dummyAlgId;
-                if (getPasskeyRecord(candidateIdHex, dummyRpId, dummyUserId, dummyUser, dummyKey, dummyAlgId)) {
+                int dummyCredProtect = 1;
+                if (getPasskeyRecord(candidateIdHex, dummyRpId, dummyUserId, dummyUser, dummyKey, dummyAlgId, dummyCredProtect, dummyLargeBlob)) {
+                    if (dummyCredProtect == 3 && !pinVerified) continue;
                     if (rpFieldMatchesPlainRpId(dummyRpId, String(targetRpId))) {
                         uint8_t err = 0x19;
                         sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
@@ -1351,7 +1444,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         mbedtls_md_free(&sha_ctx);
 
         uint8_t authDataFlags = (AUTH_BUTTON_ONLY && !pinVerified) ? 0x41 : 0x45;
-        if (hmacSecretRequested || credBlobRequested) {
+        if (hmacSecretRequested || credBlobRequested || credProtectRequested) {
             authDataFlags |= 0x80;
         }
         authData[32] = authDataFlags;
@@ -1419,17 +1512,21 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             authDataOffset += pubKeyLen;
         }
 
-        if (hmacSecretRequested || credBlobRequested) {
+        if (hmacSecretRequested || credBlobRequested || credProtectRequested) {
             CborEncoder extEncoder(&finalAuthData[authDataOffset], 8192 - authDataOffset);
-            size_t makeCredExtCount = (hmacSecretRequested ? 1 : 0) + (credBlobRequested ? 1 : 0);
+            size_t makeCredExtCount = (hmacSecretRequested ? 1 : 0) + (credBlobRequested ? 1 : 0) + (credProtectRequested ? 1 : 0);
             extEncoder.writeMapHeader(makeCredExtCount);
-            if (hmacSecretRequested) {
-                extEncoder.writeTextString("hmac-secret");
-                extEncoder.writeBoolean(true);
-            }
             if (credBlobRequested) {
                 extEncoder.writeTextString("credBlob");
                 extEncoder.writeBoolean(credBlobStored);
+            }
+            if (credProtectRequested) {
+                extEncoder.writeTextString("credProtect");
+                extEncoder.writeUnsignedInt(requestedCredProtect);
+            }
+            if (hmacSecretRequested) {
+                extEncoder.writeTextString("hmac-secret");
+                extEncoder.writeBoolean(true);
             }
             authDataOffset += extEncoder.getOffset();
         }
@@ -1522,16 +1619,21 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         size_t clientDataHashLen = 0;
         bool optionUP = true;
         bool optionUV = false;
+        bool clientRequestedUv = false;
         uint8_t gaPinUvAuthParam[32] = {0};
         size_t gaPinUvAuthParamLen = 0;
         uint64_t gaPinProtocol = 0;
         bool gaPinParamPresent = false;
 
         bool extensionRequested = false;
-        uint8_t hmacSalt1[32] = {0};
-        uint8_t hmacSalt2[32] = {0};
-        size_t hmacSalt1Len = 0;
-        size_t hmacSalt2Len = 0;
+        bool hmacKaPresent = false, hmacSaltEncPresent = false, hmacSaltAuthPresent = false;
+        uint8_t hmacKeyAgreement[64] = {0};
+        size_t hmacKaLen = 0;
+        uint8_t hmacSaltEnc[64] = {0};
+        size_t hmacSaltEncLen = 0;
+        uint8_t hmacSaltAuth[32] = {0};
+        size_t hmacSaltAuthLen = 0;
+        uint64_t hmacProtocol = 1;
         bool largeBlobKeyRequested = false;
         bool credBlobRequested = false;
 
@@ -1539,6 +1641,14 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         uint8_t allowCredentialIds[MAX_ALLOW_CREDENTIALS][MAX_CREDENTIAL_ID_LEN] = {0};
         size_t allowCredentialIdLens[MAX_ALLOW_CREDENTIALS] = {0};
         size_t allowCredentialCount = 0;
+
+        uint8_t gaValidation = ctapValidateGetAssertion(data + 1, len - 1);
+        if (gaValidation != 0) {
+            fidoLogf("GA", "request rejected by validation: 0x%02X", gaValidation);
+            sendCtapResponse(channel, CTAPHID_CBOR, &gaValidation, 1);
+            free(responseBuffer);
+            return;
+        }
 
         CborParser parser(data + 1, len - 1);
         uint8_t rootType;
@@ -1606,6 +1716,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                                 uint8_t valType; uint64_t valVal;
                                 if (parser.readTypeAndValue(valType, valVal) && valType == 7) {
                                     optionUV = (valVal == 21);
+                                    clientRequestedUv = optionUV;
                                 } else { parser.skipValue(); }
                             } else { parser.skipValue(); }
                         } else { parser.skipValue(); }
@@ -1628,9 +1739,24 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                                     uint8_t saltKeyType; uint64_t saltMapKey;
                                     if (parser.readTypeAndValue(saltKeyType, saltMapKey) && saltKeyType == 0) {
                                         if (saltMapKey == 1) {
-                                            parser.readByteString(hmacSalt1, sizeof(hmacSalt1), hmacSalt1Len);
+                                            hmacKaPresent = true;
+                                            hmacKaLen = parseCoseKeyPubXY(parser, hmacKeyAgreement) ? 64 : 0;
                                         } else if (saltMapKey == 2) {
-                                            parser.readByteString(hmacSalt2, sizeof(hmacSalt2), hmacSalt2Len);
+                                            hmacSaltEncPresent = true;
+                                            if (!parser.readByteString(hmacSaltEnc, sizeof(hmacSaltEnc), hmacSaltEncLen)) {
+                                                parser.skipValue();
+                                                hmacSaltEncLen = sizeof(hmacSaltEnc) + 1;
+                                            }
+                                        } else if (saltMapKey == 3) {
+                                            hmacSaltAuthPresent = true;
+                                            if (!parser.readByteString(hmacSaltAuth, sizeof(hmacSaltAuth), hmacSaltAuthLen)) {
+                                                parser.skipValue();
+                                                hmacSaltAuthLen = sizeof(hmacSaltAuth) + 1;
+                                            }
+                                        } else if (saltMapKey == 4) {
+                                            uint8_t pvType; uint64_t pvVal;
+                                            if (parser.readTypeAndValue(pvType, pvVal) && pvType == 0) hmacProtocol = pvVal;
+                                            else parser.skipValue();
                                         } else { parser.skipValue(); }
                                     } else { parser.skipValue(); }
                                 }
@@ -1682,7 +1808,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         bool pinVerified = false;
         if (gaPinParamPresent) {
             uint8_t err = 0;
-            if (gaPinUvAuthParamLen == 0) err = isFidoPinSet() ? 0x36 : 0x35;
+            if (gaPinUvAuthParamLen == 0) err = isFidoPinSet() ? 0x33 : 0x35;
             else if (!isFidoPinSet()) err = 0x35;
             else if (gaPinProtocol != 1) err = 0x33;
             else if (!verifyPinUvAuthParam(clientDataHash, gaPinUvAuthParam, gaPinUvAuthParamLen, 0x02)) err = 0x33;
@@ -1712,6 +1838,32 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
         } else {
             matchedCreds = findAllCredentialsByRp(String(targetRpId));
+        }
+
+        {
+            bool uvSatisfied = pinVerified || (!AUTH_BUTTON_ONLY && clientRequestedUv);
+            std::vector<String> visibleCreds;
+            for (const String &candidateHex : matchedCreds) {
+                uint8_t candBin[256];
+                size_t candLen = candidateHex.length() / 2;
+                if (candLen > sizeof(candBin)) continue;
+                fromHex(candidateHex, candBin, candLen);
+                String sUid, sName, sPriv, sRp, sLb;
+                int sAlg = 0;
+                int level = 1;
+                if (!unwrapStatelessCredential(candBin, candLen, String(targetRpId), sUid, sName, sPriv, sAlg)) {
+                    String sBlob;
+                    getPasskeyRecord(candidateHex, sRp, sUid, sName, sPriv, sAlg, level, sLb, sBlob);
+                }
+                bool hidden = (level == 3 && !uvSatisfied) || (level == 2 && !uvSatisfied && allowCredentialCount == 0);
+                if (!hidden) visibleCreds.push_back(candidateHex);
+            }
+            matchedCreds = visibleCreds;
+            if (allowCredentialCount == 0) {
+                std::reverse(matchedCreds.begin(), matchedCreds.end());
+            } else if (matchedCreds.size() > 1) {
+                matchedCreds.resize(1);
+            }
         }
 
         if (matchedCreds.empty()) {
@@ -1763,25 +1915,42 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             return;
         }
 #else
-        optionUP = true;
-        optionUV = true;
+        if (optionUP) optionUV = true;
         (void)credProtectRequiresUv;
 #endif
+        (void)clientRequestedUv;
+
+        uint8_t hmacShared[32] = {0};
+        uint8_t hmacSalts[64] = {0};
+        size_t hmacSaltsLen = 0;
+        if (extensionRequested) {
+            uint8_t hmacErr = hmacSecretPrepare(hmacKaPresent, hmacKeyAgreement, hmacKaLen,
+                                                hmacSaltEncPresent, hmacSaltEnc, hmacSaltEncLen,
+                                                hmacSaltAuthPresent, hmacSaltAuth, hmacSaltAuthLen,
+                                                hmacProtocol, hmacShared, hmacSalts, hmacSaltsLen);
+            if (hmacErr != 0) {
+                fidoLogf("GA", "hmac-secret rejected: 0x%02X", hmacErr);
+                sendCtapResponse(channel, CTAPHID_CBOR, &hmacErr, 1);
+                free(responseBuffer);
+                return;
+            }
+        }
 
         nextAssertionCreds = matchedCreds;
         nextAssertionIdx = 1;
         nextAssertionRpId = String(targetRpId);
         memcpy(nextAssertionClientHash, clientDataHash, 32);
         nextAssertionOptionUV = AUTH_BUTTON_ONLY ? pinVerified : optionUV;
+        nextAssertionFullUser = pinVerified && matchedCreds.size() > 1;
         nextAssertionExtReq = extensionRequested;
         nextAssertionLargeBlobReq = largeBlobKeyRequested;
         nextAssertionCredBlobReq = credBlobRequested;
 
+        nextAssertionSaltsLen = 0;
         if (extensionRequested) {
-            memcpy(nextAssertionSalt1, hmacSalt1, 32);
-            nextAssertionSalt1Len = hmacSalt1Len;
-            memcpy(nextAssertionSalt2, hmacSalt2, 32);
-            nextAssertionSalt2Len = hmacSalt2Len;
+            memcpy(nextAssertionShared, hmacShared, 32);
+            memcpy(nextAssertionSalts, hmacSalts, 64);
+            nextAssertionSaltsLen = hmacSaltsLen;
         }
 
         bool biometricVerified = false;
@@ -1833,7 +2002,27 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             biometricVerified = true;
         }
 
-        uint8_t authData[37] = {0};
+        bool uvPerformed = AUTH_BUTTON_ONLY ? pinVerified : (biometricVerified && (optionUP || optionUV));
+        bool includeCredBlob = credBlobRequested && storedCredBlobHex.length() > 0;
+        uint8_t hmacEnc[64] = {0};
+        size_t hmacEncLen = 0;
+        if (extensionRequested &&
+            !hmacSecretCompute(hmacShared, hmacSalts, hmacSaltsLen, storedPrivateKeyHex, uvPerformed, hmacEnc, hmacEncLen)) {
+            uint8_t err = 0x01;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
+        uint8_t blobBytes[MAX_CRED_BLOB_LEN] = {0};
+        size_t blobLen = 0;
+        if (includeCredBlob) {
+            blobLen = storedCredBlobHex.length() / 2;
+            if (blobLen > MAX_CRED_BLOB_LEN) blobLen = MAX_CRED_BLOB_LEN;
+            fromHex(storedCredBlobHex, blobBytes, blobLen);
+        }
+        uint8_t extBuf[160];
+        size_t extLen = buildAssertionExtensions(extBuf, sizeof(extBuf), hmacEnc, hmacEncLen, blobBytes, blobLen, includeCredBlob);
+        uint8_t authData[37 + 160] = {0};
 
         mbedtls_md_context_t sha_ctx;
         mbedtls_md_init(&sha_ctx);
@@ -1847,7 +2036,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         if (optionUP || optionUV) { flags |= 0x01; }
         if (!AUTH_BUTTON_ONLY && biometricVerified && (optionUP || optionUV)) { flags |= 0x04; }
         if (AUTH_BUTTON_ONLY && pinVerified) { flags |= 0x04; }
-        if (extensionRequested) { flags |= 0x80; }
+        if (extLen > 0) { flags |= 0x80; }
         authData[32] = flags;
 
         uint32_t currentSignCount = loadPersistedSignCount() + 1;
@@ -1858,9 +2047,12 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         authData[35] = (currentSignCount >> 8) & 0xFF;
         authData[36] = (currentSignCount) & 0xFF;
 
-        uint8_t signBuffer[69];
-        memcpy(signBuffer, authData, 37);
-        memcpy(signBuffer + 37, clientDataHash, 32);
+        memcpy(authData + 37, extBuf, extLen);
+        size_t authLen = 37 + extLen;
+        uint8_t signBuffer[37 + 160 + 32];
+        memcpy(signBuffer, authData, authLen);
+        memcpy(signBuffer + authLen, clientDataHash, 32);
+        size_t signLen = authLen + 32;
 
         uint8_t* signatureASN1 = nullptr;
         size_t finalSigLen = 0;
@@ -1868,7 +2060,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         struct AsyncSignAuth {
             int alg; String pk; uint8_t* msg; size_t mLen;
             uint8_t** sig; size_t* sLen; volatile bool done; bool res;
-        } sCtx = {storedAlgId, storedPrivateKeyHex, signBuffer, sizeof(signBuffer), &signatureASN1, &finalSigLen, false, false};
+        } sCtx = {storedAlgId, storedPrivateKeyHex, signBuffer, signLen, &signatureASN1, &finalSigLen, false, false};
 
         BaseType_t gaSignTaskRc = xTaskCreatePinnedToCore([](void* p){
             AsyncSignAuth* c = (AsyncSignAuth*)p;
@@ -1899,31 +2091,6 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             return;
         }
 
-        uint8_t hmacOutput1[32] = {0};
-        uint8_t hmacOutput2[32] = {0};
-        if (extensionRequested && hmacSalt1Len == 32) {
-            uint8_t rawKeyBytes[32] = {0};
-
-            fromHex(storedPrivateKeyHex, rawKeyBytes, 32);
-
-            mbedtls_md_init(&sha_ctx);
-            mbedtls_md_setup(&sha_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-            mbedtls_md_hmac_starts(&sha_ctx, rawKeyBytes, 32);
-            mbedtls_md_hmac_update(&sha_ctx, hmacSalt1, 32);
-            mbedtls_md_hmac_finish(&sha_ctx, hmacOutput1);
-            mbedtls_md_free(&sha_ctx);
-
-            if (hmacSalt2Len == 32) {
-                mbedtls_md_init(&sha_ctx);
-                mbedtls_md_setup(&sha_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-                mbedtls_md_hmac_starts(&sha_ctx, rawKeyBytes, 32);
-                mbedtls_md_hmac_update(&sha_ctx, hmacSalt2, 32);
-                mbedtls_md_hmac_finish(&sha_ctx, hmacOutput2);
-                mbedtls_md_free(&sha_ctx);
-            }
-            memset(rawKeyBytes, 0, 32);
-        }
-
         uint8_t* localRespBuf = (uint8_t*)malloc(8192);
         if (!localRespBuf) {
             uint8_t err = 0x01;
@@ -1938,13 +2105,11 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         CborEncoder localEncoder(&localRespBuf[1], 8191);
 
         bool includeLargeBlobKey = largeBlobKeyRequested && storedLargeBlobKeyHex.length() == 64;
+        bool userInfoFull = pinVerified && matchedCreds.size() > 1;
         bool includeUserEntity = storedUserIdHex.length() > 0;
-        bool includeCredBlob = credBlobRequested && storedCredBlobHex.length() > 0;
-        bool hasExtOutput = extensionRequested || includeCredBlob;
 
         size_t mapItems = 3;
         if (includeUserEntity) mapItems++;
-        if (hasExtOutput) mapItems++;
         if (matchedCreds.size() > 1) mapItems++;
         if (includeLargeBlobKey) mapItems++;
         localEncoder.writeMapHeader(mapItems);
@@ -1957,23 +2122,25 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         localEncoder.writeTextString("public-key");
 
         localEncoder.writeUnsignedInt(0x02);
-        localEncoder.writeByteString(authData, 37);
+        localEncoder.writeByteString(authData, authLen);
 
         localEncoder.writeUnsignedInt(0x03);
         localEncoder.writeByteString(signatureASN1, finalSigLen);
 
         if (includeUserEntity) {
             localEncoder.writeUnsignedInt(0x04);
-            localEncoder.writeMapHeader(3);
+            localEncoder.writeMapHeader(userInfoFull ? 3 : 1);
             localEncoder.writeTextString("id");
             uint8_t rawUserIdBytes[64];
             size_t parsedUserIdLen = storedUserIdHex.length() / 2;
             fromHex(storedUserIdHex, rawUserIdBytes, parsedUserIdLen);
             localEncoder.writeByteString(rawUserIdBytes, parsedUserIdLen);
-            localEncoder.writeTextString("name");
-            localEncoder.writeTextString(storedUserName.c_str());
-            localEncoder.writeTextString("displayName");
-            localEncoder.writeTextString(storedUserName.c_str());
+            if (userInfoFull) {
+                localEncoder.writeTextString("name");
+                localEncoder.writeTextString(storedUserName.c_str());
+                localEncoder.writeTextString("displayName");
+                localEncoder.writeTextString(storedUserName.c_str());
+            }
         }
 
         if (matchedCreds.size() > 1) {
@@ -1987,30 +2154,6 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             fromHex(storedLargeBlobKeyHex, rawLargeBlobKeyOut, 32);
             localEncoder.writeByteString(rawLargeBlobKeyOut, 32);
             memset(rawLargeBlobKeyOut, 0, 32);
-        }
-
-        if (hasExtOutput) {
-            localEncoder.writeUnsignedInt(0x08);
-            size_t gaExtCount = (extensionRequested ? 1 : 0) + (includeCredBlob ? 1 : 0);
-            localEncoder.writeMapHeader(gaExtCount);
-            if (extensionRequested) {
-                localEncoder.writeTextString("hmac-secret");
-                if (hmacSalt2Len == 32) {
-                    uint8_t combined[64];
-                    memcpy(combined, hmacOutput1, 32);
-                    memcpy(combined + 32, hmacOutput2, 32);
-                    localEncoder.writeByteString(combined, 64);
-                } else {
-                    localEncoder.writeByteString(hmacOutput1, 32);
-                }
-            }
-            if (includeCredBlob) {
-                localEncoder.writeTextString("credBlob");
-                uint8_t rawCredBlobOut[MAX_CRED_BLOB_LEN];
-                size_t rawCredBlobOutLen = storedCredBlobHex.length() / 2;
-                fromHex(storedCredBlobHex, rawCredBlobOut, rawCredBlobOutLen);
-                localEncoder.writeByteString(rawCredBlobOut, rawCredBlobOutLen);
-            }
         }
 
         sendCtapResponse(channel, CTAPHID_CBOR, localRespBuf, 1 + localEncoder.getOffset());
@@ -2094,7 +2237,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         if (subCommand == 0x01) {
             encoder.writeMapHeader(1);
             encoder.writeUnsignedInt(0x03);
-            encoder.writeUnsignedInt(10 - getFailedFidoPinAttempts());
+            encoder.writeUnsignedInt(8 - getFailedFidoPinAttempts());
         }
 
         else if (subCommand == 0x02) {
@@ -2106,7 +2249,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             encoder.writeUnsignedInt(0x01);
             encoder.writeMapHeader(5);
             encoder.writeUnsignedInt(0x01); encoder.writeUnsignedInt(0x02);
-            encoder.writeUnsignedInt(0x03); encoder.writeNegativeInt(-7);
+            encoder.writeUnsignedInt(0x03); encoder.writeNegativeInt(-25);
             encoder.writeNegativeInt(-1); encoder.writeUnsignedInt(0x01);
             encoder.writeNegativeInt(-2); encoder.writeByteString(pubKey + 1, 32);
             encoder.writeNegativeInt(-3); encoder.writeByteString(pubKey + 33, 32);
@@ -2146,6 +2289,13 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
             size_t pinLen = 0;
             while (pinLen < 64 && paddedPin[pinLen] != 0x00) pinLen++;
+            if (pinLen >= 64) {
+                memset(paddedPin, 0, sizeof(paddedPin));
+                uint8_t err = 0x37;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
             String decryptedPin;
             decryptedPin.reserve(pinLen);
             for (size_t i = 0; i < pinLen; i++) decryptedPin += (char)paddedPin[i];
@@ -2169,7 +2319,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
-            if (getFailedFidoPinAttempts() >= 10) {
+            if (getFailedFidoPinAttempts() >= 8) {
                 uint8_t err = 0x32;
                 sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                 free(responseBuffer);
@@ -2215,6 +2365,13 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             }
             size_t pinLen = 0;
             while (pinLen < 64 && paddedPin[pinLen] != 0x00) pinLen++;
+            if (pinLen >= 64) {
+                memset(paddedPin, 0, sizeof(paddedPin));
+                uint8_t err = 0x37;
+                sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+                free(responseBuffer);
+                return;
+            }
             String decryptedNewPin;
             decryptedNewPin.reserve(pinLen);
             for (size_t i = 0; i < pinLen; i++) decryptedNewPin += (char)paddedPin[i];
@@ -2239,7 +2396,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
-            if (getFailedFidoPinAttempts() >= 10) {
+            if (getFailedFidoPinAttempts() >= 8) {
                 uint8_t err = 0x32;
                 sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                 free(responseBuffer);
@@ -2292,7 +2449,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
                 free(responseBuffer);
                 return;
             }
-            if (getFailedFidoPinAttempts() >= 10) {
+            if (getFailedFidoPinAttempts() >= 8) {
                 uint8_t err = 0x32;
                 sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
                 free(responseBuffer);
@@ -2356,6 +2513,12 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         return;
     }
     else if (ctap2Cmd == 0x07) {
+        if (millis() - fidoPowerUpMillis > 10000UL) {
+            uint8_t err = CTAP2_ERR_NOT_ALLOWED;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
         showDisplayMessage(1, "RESET FIDO2", UI_PROMPT_TOUCH, 0);
 
         bool biometricVerified = false;
@@ -2445,7 +2608,26 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             if (storedUserName.length() == 0) storedUserName = "Stateless User";
         }
 
-        uint8_t authData[37] = {0};
+        bool nextIncludeCredBlob = nextAssertionCredBlobReq && storedCredBlobHex.length() > 0;
+        uint8_t hmacEnc[64] = {0};
+        size_t hmacEncLen = 0;
+        if (nextAssertionExtReq && nextAssertionSaltsLen > 0 &&
+            !hmacSecretCompute(nextAssertionShared, nextAssertionSalts, nextAssertionSaltsLen, storedPrivateKeyHex, nextAssertionOptionUV, hmacEnc, hmacEncLen)) {
+            uint8_t err = 0x01;
+            sendCtapResponse(channel, CTAPHID_CBOR, &err, 1);
+            free(responseBuffer);
+            return;
+        }
+        uint8_t blobBytes[MAX_CRED_BLOB_LEN] = {0};
+        size_t blobLen = 0;
+        if (nextIncludeCredBlob) {
+            blobLen = storedCredBlobHex.length() / 2;
+            if (blobLen > MAX_CRED_BLOB_LEN) blobLen = MAX_CRED_BLOB_LEN;
+            fromHex(storedCredBlobHex, blobBytes, blobLen);
+        }
+        uint8_t extBuf[160];
+        size_t extLen = buildAssertionExtensions(extBuf, sizeof(extBuf), hmacEnc, hmacEncLen, blobBytes, blobLen, nextIncludeCredBlob);
+        uint8_t authData[37 + 160] = {0};
         mbedtls_md_context_t sha_ctx;
         mbedtls_md_init(&sha_ctx);
         mbedtls_md_setup(&sha_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
@@ -2456,7 +2638,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
 
         uint8_t flags = 0x01;
         if (nextAssertionOptionUV) flags |= 0x04;
-        if (nextAssertionExtReq) flags |= 0x80;
+        if (extLen > 0) flags |= 0x80;
         authData[32] = flags;
 
         uint32_t currentSignCount = loadPersistedSignCount() + 1;
@@ -2467,9 +2649,12 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         authData[35] = (currentSignCount >> 8) & 0xFF;
         authData[36] = (currentSignCount) & 0xFF;
 
-        uint8_t signBuffer[69];
-        memcpy(signBuffer, authData, 37);
-        memcpy(signBuffer + 37, nextAssertionClientHash, 32);
+        memcpy(authData + 37, extBuf, extLen);
+        size_t authLen = 37 + extLen;
+        uint8_t signBuffer[37 + 160 + 32];
+        memcpy(signBuffer, authData, authLen);
+        memcpy(signBuffer + authLen, nextAssertionClientHash, 32);
+        size_t signLen = authLen + 32;
 
         uint8_t* signatureASN1 = nullptr;
         size_t finalSigLen = 0;
@@ -2477,7 +2662,7 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         struct AsyncSignAuth {
             int alg; String pk; uint8_t* msg; size_t mLen;
             uint8_t** sig; size_t* sLen; volatile bool done; bool res;
-        } sCtx = {storedAlgId, storedPrivateKeyHex, signBuffer, sizeof(signBuffer), &signatureASN1, &finalSigLen, false, false};
+        } sCtx = {storedAlgId, storedPrivateKeyHex, signBuffer, signLen, &signatureASN1, &finalSigLen, false, false};
 
         BaseType_t gnaSignTaskRc = xTaskCreatePinnedToCore([](void* p){
             AsyncSignAuth* c = (AsyncSignAuth*)p;
@@ -2504,30 +2689,6 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             return;
         }
 
-        uint8_t hmacOutput1[32] = {0};
-        uint8_t hmacOutput2[32] = {0};
-        if (nextAssertionExtReq && nextAssertionSalt1Len == 32) {
-            uint8_t rawKeyBytes[32] = {0};
-            fromHex(storedPrivateKeyHex, rawKeyBytes, 32);
-
-            mbedtls_md_init(&sha_ctx);
-            mbedtls_md_setup(&sha_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-            mbedtls_md_hmac_starts(&sha_ctx, rawKeyBytes, 32);
-            mbedtls_md_hmac_update(&sha_ctx, nextAssertionSalt1, 32);
-            mbedtls_md_hmac_finish(&sha_ctx, hmacOutput1);
-            mbedtls_md_free(&sha_ctx);
-
-            if (nextAssertionSalt2Len == 32) {
-                mbedtls_md_init(&sha_ctx);
-                mbedtls_md_setup(&sha_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-                mbedtls_md_hmac_starts(&sha_ctx, rawKeyBytes, 32);
-                mbedtls_md_hmac_update(&sha_ctx, nextAssertionSalt2, 32);
-                mbedtls_md_hmac_finish(&sha_ctx, hmacOutput2);
-                mbedtls_md_free(&sha_ctx);
-            }
-            memset(rawKeyBytes, 0, 32);
-        }
-
         uint8_t* localRespBuf = (uint8_t*)malloc(8192);
         if (!localRespBuf) {
             uint8_t err = 0x01;
@@ -2540,14 +2701,12 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         localRespBuf[0] = 0x00;
 
         bool includeLargeBlobKey = nextAssertionLargeBlobReq && storedLargeBlobKeyHex.length() == 64;
+        bool userInfoFull = nextAssertionFullUser;
         bool includeUserEntity = storedUserIdHex.length() > 0;
-        bool includeCredBlob = nextAssertionCredBlobReq && storedCredBlobHex.length() > 0;
-        bool hasExtOutput = nextAssertionExtReq || includeCredBlob;
 
         CborEncoder localEncoder(&localRespBuf[1], 8191);
         size_t mapItems = 3;
         if (includeUserEntity) mapItems++;
-        if (hasExtOutput) mapItems++;
         if (includeLargeBlobKey) mapItems++;
         localEncoder.writeMapHeader(mapItems);
 
@@ -2559,23 +2718,25 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
         localEncoder.writeTextString("public-key");
 
         localEncoder.writeUnsignedInt(0x02);
-        localEncoder.writeByteString(authData, 37);
+        localEncoder.writeByteString(authData, authLen);
 
         localEncoder.writeUnsignedInt(0x03);
         localEncoder.writeByteString(signatureASN1, finalSigLen);
 
         if (includeUserEntity) {
             localEncoder.writeUnsignedInt(0x04);
-            localEncoder.writeMapHeader(3);
+            localEncoder.writeMapHeader(userInfoFull ? 3 : 1);
             localEncoder.writeTextString("id");
             uint8_t rawUserIdBytes[64];
             size_t parsedUserIdLen = storedUserIdHex.length() / 2;
             fromHex(storedUserIdHex, rawUserIdBytes, parsedUserIdLen);
             localEncoder.writeByteString(rawUserIdBytes, parsedUserIdLen);
-            localEncoder.writeTextString("name");
-            localEncoder.writeTextString(storedUserName.c_str());
-            localEncoder.writeTextString("displayName");
-            localEncoder.writeTextString(storedUserName.c_str());
+            if (userInfoFull) {
+                localEncoder.writeTextString("name");
+                localEncoder.writeTextString(storedUserName.c_str());
+                localEncoder.writeTextString("displayName");
+                localEncoder.writeTextString(storedUserName.c_str());
+            }
         }
 
         if (includeLargeBlobKey) {
@@ -2584,30 +2745,6 @@ void FIDO2HIDDevice::processCborCommand(uint32_t channel, uint8_t* data, uint16_
             fromHex(storedLargeBlobKeyHex, rawLargeBlobKeyOut, 32);
             localEncoder.writeByteString(rawLargeBlobKeyOut, 32);
             memset(rawLargeBlobKeyOut, 0, 32);
-        }
-
-        if (hasExtOutput) {
-            localEncoder.writeUnsignedInt(0x08);
-            size_t gnaExtCount = (nextAssertionExtReq ? 1 : 0) + (includeCredBlob ? 1 : 0);
-            localEncoder.writeMapHeader(gnaExtCount);
-            if (nextAssertionExtReq) {
-                localEncoder.writeTextString("hmac-secret");
-                if (nextAssertionSalt2Len == 32) {
-                    uint8_t combined[64];
-                    memcpy(combined, hmacOutput1, 32);
-                    memcpy(combined + 32, hmacOutput2, 32);
-                    localEncoder.writeByteString(combined, 64);
-                } else {
-                    localEncoder.writeByteString(hmacOutput1, 32);
-                }
-            }
-            if (includeCredBlob) {
-                localEncoder.writeTextString("credBlob");
-                uint8_t rawCredBlobOut[MAX_CRED_BLOB_LEN];
-                size_t rawCredBlobOutLen = storedCredBlobHex.length() / 2;
-                fromHex(storedCredBlobHex, rawCredBlobOut, rawCredBlobOutLen);
-                localEncoder.writeByteString(rawCredBlobOut, rawCredBlobOutLen);
-            }
         }
 
         sendCtapResponse(channel, CTAPHID_CBOR, localRespBuf, 1 + localEncoder.getOffset());
@@ -3678,13 +3815,40 @@ FIDO2HIDDevice::~FIDO2HIDDevice() {
 void FIDO2HIDDevice::_onOutput(uint8_t report_id, const uint8_t* buffer, uint16_t len) {
     if (len < 7) return;
 
+#ifdef FIDO_TEST_AUTO_UP
+    static const uint8_t softRebootMagic[64] = {
+        0xac, 0x10, 0x52, 0xca, 0x95, 0xe5, 0x69, 0xde, 0x69, 0xe0, 0x2e, 0xbf,
+        0xf3, 0x33, 0x48, 0x5f, 0x13, 0xf9, 0xb2, 0xda, 0x34, 0xc5, 0xa8, 0xa3,
+        0x40, 0x52, 0x66, 0x97, 0xa9, 0xab, 0x2e, 0x0b, 0x39, 0x4d, 0x8d, 0x04,
+        0x97, 0x3c, 0x13, 0x40, 0x05, 0xbe, 0x1a, 0x01, 0x40, 0xbf, 0xf6, 0x04,
+        0x5b, 0xb2, 0x6e, 0xb7, 0x7a, 0x73, 0xea, 0xa4, 0x78, 0x13, 0xf6, 0xb4,
+        0x9a, 0x72, 0x50, 0xdc};
+    if (len >= 64 && memcmp(buffer, softRebootMagic, 64) == 0) {
+        fidoPowerUpMillis = millis();
+        sessionKeyValid = false;
+        activeAuthTokenValid = false;
+        nextAssertionCreds.clear();
+        nextAssertionIdx = 0;
+        ctapExpectedLen = 0;
+        ctapReceivedLen = 0;
+        ctapExpectedSeq = 0;
+        return;
+    }
+#endif
+
     if (ctapExpectedLen > 0 && (millis() - lastPacketTime > 500)) {
         ctapExpectedLen = 0;
         ctapReceivedLen = 0;
         ctapExpectedSeq = 0;
     }
 
-    uint32_t channel = (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3];
+    uint32_t channel = ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) | ((uint32_t)buffer[2] << 8) | buffer[3];
+
+    if (channel == 0 || (channel == 0xFFFFFFFF && buffer[4] != CTAPHID_INIT)) {
+        uint8_t err = 0x0B;
+        sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
+        return;
+    }
 
     if (buffer[4] & 0x80) {
         uint8_t cmd = buffer[4];
@@ -3702,8 +3866,19 @@ void FIDO2HIDDevice::_onOutput(uint8_t report_id, const uint8_t* buffer, uint16_
         }
 
         if (hasPendingCommand) {
-            uint8_t err = 0x05;
+            uint8_t err = 0x06;
             sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
+            return;
+        }
+
+        if (ctapExpectedLen > 0 && cmd != CTAPHID_INIT) {
+            uint8_t err = (channel == ctapCurrentChannel) ? 0x04 : 0x06;
+            sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
+            if (channel == ctapCurrentChannel) {
+                ctapExpectedLen = 0;
+                ctapReceivedLen = 0;
+                ctapExpectedSeq = 0;
+            }
             return;
         }
 
@@ -3712,10 +3887,18 @@ void FIDO2HIDDevice::_onOutput(uint8_t report_id, const uint8_t* buffer, uint16_
         ctapCurrentChannel = channel;
 
         if (ctapExpectedLen > 7609) {
-            uint8_t err = 0x01;
+            uint8_t err = 0x03;
             sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
             ctapExpectedLen = 0;
             ctapReceivedLen = 0;
+            return;
+        }
+
+        if (ctapExpectedLen == 0) {
+            pendingChannel = channel;
+            pendingCmd = cmd;
+            pendingLen = 0;
+            hasPendingCommand = true;
             return;
         }
 
@@ -3743,7 +3926,12 @@ void FIDO2HIDDevice::_onOutput(uint8_t report_id, const uint8_t* buffer, uint16_
         lastPacketTime = millis();
     }
     else {
-        if (ctapExpectedLen == 0 || channel != ctapCurrentChannel) return;
+        if (ctapExpectedLen == 0) return;
+        if (channel != ctapCurrentChannel) {
+            uint8_t err = 0x06;
+            sendCtapResponse(channel, CTAPHID_ERROR, &err, 1);
+            return;
+        }
 
         if (buffer[4] != ctapExpectedSeq) {
             uint8_t err = 0x04;
@@ -3798,6 +3986,14 @@ void FIDO2HIDDevice::_onOutput(uint8_t report_id, const uint8_t* buffer, uint16_
 }
 
 void FIDO2HIDDevice::poll() {
+    if (!hasPendingCommand && ctapExpectedLen > 0 && millis() - lastPacketTime > 500) {
+        uint8_t err = 0x05;
+        sendCtapResponse(ctapCurrentChannel, CTAPHID_ERROR, &err, 1);
+        ctapExpectedLen = 0;
+        ctapReceivedLen = 0;
+        ctapExpectedSeq = 0;
+        return;
+    }
     if (!hasPendingCommand) return;
 
     uint32_t ch   = pendingChannel;
