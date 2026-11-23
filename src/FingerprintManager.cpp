@@ -109,6 +109,40 @@ void setFingerprintLed(bool on) {
 #endif
 }
 
+static int cachedTemplateCount = -1;
+
+void invalidateFingerprintCount() {
+    cachedTemplateCount = -1;
+}
+
+int getEnrolledFingerprintCount() {
+#if AUTH_BUTTON_ONLY
+    return 0;
+#else
+    if (cachedTemplateCount >= 0) return cachedTemplateCount;
+    if (!fingerprintPowerOn()) return -1;
+    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
+    uint8_t rc = finger.getTemplateCount();
+    int n = (rc == FINGERPRINT_OK) ? (int)finger.templateCount : -1;
+    xSemaphoreGive(fingerprintMutex);
+    fingerprintKeepAlive();
+    if (n >= 0) cachedTemplateCount = n;
+    return n;
+#endif
+}
+
+void fingerprintIndicate(bool success) {
+#if !AUTH_BUTTON_ONLY
+    if (!fingerprintPowered || !fingerprintReady) return;
+    xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
+    finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 20, success ? FP_LED_SUCCESS_COLOR : FP_LED_FAILURE_COLOR, 2);
+    xSemaphoreGive(fingerprintMutex);
+    fingerprintKeepAlive();
+#else
+    (void)success;
+#endif
+}
+
 void initFingerprintSensor() {
 #ifdef FIDO_TEST_AUTO_UP
     Serial.println("[SYS:WARN] TEST BUILD: user presence and verification are bypassed");
@@ -118,6 +152,7 @@ void initFingerprintSensor() {
     CommsManager::sendEvent("SYS", "BUTTON_READY");
 #else
     if (fingerprintPowerOn()) {
+        getEnrolledFingerprintCount();
         CommsManager::sendEvent("SYS", "FP_READY");
     } else {
         showDisplayMessage(1, "SENSOR ERROR!", "", 2000);
@@ -215,6 +250,7 @@ bool enrollFingerprint(uint8_t id) {
     xSemaphoreTake(fingerprintMutex, portMAX_DELAY);
     p = finger.storeModel(id);
     xSemaphoreGive(fingerprintMutex);
+    invalidateFingerprintCount();
     setFingerprintLed(false);
     if (p == FINGERPRINT_OK) {
         showDisplayMessage(1, "STORED OK", "", 2000);

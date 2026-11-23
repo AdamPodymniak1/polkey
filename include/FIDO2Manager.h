@@ -26,7 +26,7 @@
 
 uint32_t loadPersistedSignCount();
 void savePersistedSignCount(uint32_t count);
-bool fidoVerifyFingerprint();
+bool fidoVerifyFingerprint(bool allowUnenrolled = false);
 
 extern const uint8_t fido_report_descriptor[34];
 

@@ -18,6 +18,16 @@ void updateFingerprintAsync();
 void deleteAllFingerprints();
 void setFingerprintLed(bool on);
 
+#ifndef FP_LED_SUCCESS_COLOR
+#define FP_LED_SUCCESS_COLOR 0x04
+#endif
+#ifndef FP_LED_FAILURE_COLOR
+#define FP_LED_FAILURE_COLOR FINGERPRINT_LED_RED
+#endif
+void fingerprintIndicate(bool success);
+int getEnrolledFingerprintCount();
+void invalidateFingerprintCount();
+
 bool fingerprintPowerOn();
 void fingerprintPowerOff();
 void fingerprintPowerIdleCheck();

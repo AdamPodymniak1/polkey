@@ -845,6 +845,53 @@ bool getFidoKeyForSource(int source, byte *outKey256) {
     return false;
 }
 
+static int publicKeyRngCallback(void *ctx, unsigned char *buf, size_t len) {
+    (void)ctx;
+    esp_fill_random(buf, len);
+    return 0;
+}
+
+bool deriveCredentialPublicKey(int algId, const String &privateKeyHex, uint8_t *out, size_t &outLen) {
+    outLen = 0;
+    if (privateKeyHex.length() != 64) return false;
+    uint8_t priv[32];
+    if (fromHex(privateKeyHex, priv, 32) != 32) return false;
+
+    if (algId == -8) {
+        Ed25519::derivePublicKey(out, priv);
+        memset(priv, 0, sizeof(priv));
+        outLen = 32;
+        return true;
+    }
+    if (algId != -7) {
+        memset(priv, 0, sizeof(priv));
+        return false;
+    }
+
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_point Q;
+    mbedtls_mpi d;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_point_init(&Q);
+    mbedtls_mpi_init(&d);
+    uint8_t buf[65];
+    size_t written = 0;
+    bool ok = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+              mbedtls_mpi_read_binary(&d, priv, 32) == 0 &&
+              mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, publicKeyRngCallback, nullptr) == 0 &&
+              mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED, &written, buf, sizeof(buf)) == 0 &&
+              written == 65;
+    if (ok) {
+        memcpy(out, buf + 1, 64);
+        outLen = 64;
+    }
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_ecp_group_free(&grp);
+    memset(priv, 0, sizeof(priv));
+    return ok;
+}
+
 void getFidoHardwareKey(byte* outKey256) {
     if (!getFidoKeyForSource(currentFidoKeySource(), outKey256)) {
         esp_fill_random(outKey256, 32);
